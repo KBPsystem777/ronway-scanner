@@ -2,8 +2,6 @@
 
 ## Post-Quantum Cryptographic Vulnerability Scanner
 
-### Named for Ronnie (dad) and Liway (mom) — Built by Koleen Baes Paunon
-
 ---
 
 > **How to use this document:**
@@ -1239,7 +1237,7 @@ v2.1 (Month 4)
 
 Register immediately:
 - ronwayscanner.com
-- github.com/pilipinas-rs/ronway-scanner
+- github.com/kbpsystem777/ronway-scanner
 - crates.io: ronway-scanner
 
 First post on X after v1 ships:
@@ -1248,13 +1246,12 @@ First post on X after v1 ships:
 Shipped RonwayScanner v1.0.0.
 
 Post-quantum cryptographic vulnerability scanner for Philippine institutions.
-Free and open source.
 
 Named for my parents: Ronnie and Liway.
 
 ronway scan --target [any domain]
 
-github.com/pilipinas-rs/ronway-scanner
+github.com/kbpsystem777/ronway-scanner
 
 🇵🇭 ⚛
 

@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Crate name:** `ronway-scanner`
 - **Tagline:** "Know your quantum risk before it knows you."
 - **Named for:** Ronnie (dad) and Liway (mom) — Built by Koleen Baes Paunon / BPxAI
+- **License:** Proprietary / All Rights Reserved — do NOT add MIT or open-source license headers
 
-RonwayScanner is a post-quantum cryptographic vulnerability scanner. It connects to remote targets over TLS, inspects their cipher suites, X.509 certificates, and HTTP security headers, then scores them against NIST PQC guidance (FIPS 203/204/205) and generates reports for developers and CISOs.
+RonwayScanner is a post-quantum cryptographic vulnerability scanner and the core commercial product of BPxAI. It connects to remote targets over TLS, inspects their cipher suites, X.509 certificates, and HTTP security headers, then scores them against NIST PQC guidance (FIPS 203/204/205) and generates reports for developers and CISOs.
 
 **v1 scope: remote scan only.** Local filesystem scanning is v2. Do not build v2 features.
 
