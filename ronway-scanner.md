@@ -1266,5 +1266,4 @@ That is your launch.
 
 ---
 
-_RonwayScanner — Named for Ronnie and Liway — Built by Koleen Baes Paunon_
-_BPxAI — bpxai.com — @KBPsystem_
+_RonwayScanner — Built by Koleen Baes Paunon_ for _BPxAI — bpxai.com — @KBPsystem_
