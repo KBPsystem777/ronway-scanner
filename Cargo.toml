@@ -22,3 +22,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 hickory-resolver = "0.24"
+
+[[test]]
+name = "scoring_test"
+path = "tests/unit/scoring_test.rs"
