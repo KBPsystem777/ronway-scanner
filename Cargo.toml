@@ -26,3 +26,7 @@ hickory-resolver = "0.24"
 [[test]]
 name = "scoring_test"
 path = "tests/unit/scoring_test.rs"
+
+[[test]]
+name = "tls_scan_test"
+path = "tests/integration/tls_scan_test.rs"
