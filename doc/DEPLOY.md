@@ -16,7 +16,7 @@ with a persistent SQLite scan history.
 ```
 
 **Target instance (yours):** `Nginx-1`, 512 MB / 2 vCPU / 20 GB, region
-`ap-southeast-1` (Singapore), public IP **52.221.218.140**.
+`ap-southeast-1` (Singapore), public IP **13.250.63.211**.
 
 ---
 
@@ -38,14 +38,20 @@ terminal, connect with the default key you downloaded
 
 ```bash
 chmod 600 LightsailDefaultKey-ap-southeast-1.pem   # SSH refuses world-readable keys
-ssh -i LightsailDefaultKey-ap-southeast-1.pem bitnami@52.221.218.140
+ssh -i LightsailDefaultKey-ap-southeast-1.pem bitnami@13.250.63.211
+```
+
+If you've moved the key to `~/.ssh/` (recommended):
+
+```bash
+ssh -i ~/.ssh/LightsailDefaultKey-ap-southeast-1.pem admin@13.250.63.211
 ```
 
 **Windows PowerShell** (OpenSSH checks NTFS ACLs, not chmod — tighten them once):
 
 ```powershell
 icacls .\LightsailDefaultKey-ap-southeast-1.pem /inheritance:r /grant:r "$($env:USERNAME):(R)"
-ssh -i .\LightsailDefaultKey-ap-southeast-1.pem bitnami@52.221.218.140
+ssh -i .\LightsailDefaultKey-ap-southeast-1.pem bitnami@13.250.63.211
 ```
 
 > Keep the `.pem` private — store it outside the repo (e.g. `~/.ssh/`). It's
@@ -78,13 +84,14 @@ free -h   # confirm swap is active
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2 git
+sudo apt-get install -y docker.io docker-compose git
+
 sudo usermod -aG docker bitnami      # run docker without sudo
 sudo systemctl enable --now docker
 exit                                 # log out/in so the group takes effect
 ```
 
-Reconnect (`ssh bitnami@52.221.218.140`), then `docker ps` should work.
+Reconnect (`ssh bitnami@13.250.63.211`), then `docker ps` should work.
 
 ---
 
@@ -93,7 +100,7 @@ Reconnect (`ssh bitnami@52.221.218.140`), then `docker ps` should work.
 ```bash
 git clone https://github.com/KBPsystem777/ronway-scanner.git
 cd ronway-scanner
-docker compose up -d --build         # first build is slow on this box (~10–20 min)
+sudo docker compose up -d --build         # first build is slow on this box (~10–20 min)
 ```
 
 Confirm it's healthy on loopback (the container binds `127.0.0.1:3001`):
@@ -114,7 +121,7 @@ restarts and redeploys.
 Create an **A record** for your subdomain → the instance IP:
 
 ```
-ronway-api.bpxai.com.   A   52.221.218.140
+ronway-api.bpxai.com.   A   13.250.63.211
 ```
 
 (Optionally also an AAAA record to the IPv6 shown in the Lightsail console.)
@@ -181,7 +188,7 @@ const res = await fetch("https://ronway-api.bpxai.com/api/scan", {
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ target: "koleenbp.com" }),
 });
-const report = await res.json();   // free-tier PublicScanReport
+const report = await res.json(); // free-tier PublicScanReport
 ```
 
 History/aggregation for your dashboard:
@@ -236,9 +243,9 @@ Or snapshot the whole instance/disk from the Lightsail **Snapshots** tab.
 
 ## Costs (rough, ap-southeast-1)
 
-| Item | $/mo |
-|---|---|
-| Lightsail 512 MB instance | ~$5.00 (flat, includes 1 TB transfer) |
-| Static IP (attached) | $0 |
-| HTTPS (bncert / Let's Encrypt) | $0 |
-| **Total** | **~$5/mo** |
+| Item                           | $/mo                                  |
+| ------------------------------ | ------------------------------------- |
+| Lightsail 512 MB instance      | ~$5.00 (flat, includes 1 TB transfer) |
+| Static IP (attached)           | $0                                    |
+| HTTPS (bncert / Let's Encrypt) | $0                                    |
+| **Total**                      | **~$5/mo**                            |

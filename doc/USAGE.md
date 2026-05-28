@@ -171,7 +171,7 @@ RonwayScanner API
 ```
 
 > **This terminal is now the server — it's supposed to block and stay
-> occupied.** That's not a hang. Open a *second* terminal to send requests.
+> occupied.** That's not a hang. Open a _second_ terminal to send requests.
 > Stop the server with `Ctrl-C`.
 
 In that **second** terminal, call it. Note: in PowerShell, `curl` is an alias
@@ -211,11 +211,11 @@ The server enforces guard rails you can't override from the request:
 
 `scan` and `bulk` use exit codes so you can gate a pipeline on quantum risk:
 
-| Code | Meaning |
-|---|---|
-| `0` | Risk score `< 60` — passing. |
-| `1` | Risk score `>= 60` — fail the build. |
-| `2` | Setup error (missing file, bad arguments, etc.). |
+| Code | Meaning                                          |
+| ---- | ------------------------------------------------ |
+| `0`  | Risk score `< 60` — passing.                     |
+| `1`  | Risk score `>= 60` — fail the build.             |
+| `2`  | Setup error (missing file, bad arguments, etc.). |
 
 Check it in PowerShell with `$LASTEXITCODE`:
 
@@ -266,6 +266,7 @@ more verbosity, set `RUST_LOG`:
 ```powershell
 $env:RUST_LOG = "ronway_scanner=debug"   # PowerShell
 ```
+
 ```bash
 RUST_LOG=ronway_scanner=debug ./target/release/ronway.exe serve   # bash
 ```
@@ -280,6 +281,7 @@ still running. Find and stop it, or pick another port.
 Get-NetTCPConnection -LocalPort 3001 | Select-Object OwningProcess
 Stop-Process -Id <PID> -Force
 ```
+
 ```bash
 # Or in bash:
 netstat -ano | grep 3001 | grep LISTENING   # shows the PID in the last column
