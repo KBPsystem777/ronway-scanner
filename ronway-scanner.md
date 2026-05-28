@@ -19,7 +19,7 @@ Name:        RonwayScanner
 Binary:      ronway
 Crate name:  ronway-scanner
 GitHub:      github.com/kbpsystem777/ronway-scanner
-Website:     ronwayscanner.com (register this) or ronway.bpxai.com
+Website:     ronway-api.bpxai.com
 Tagline:     "Know your quantum risk before it knows you."
 License:     MIT (OSS core) + Commercial (SaaS tier)
 ```
