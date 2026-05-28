@@ -16,7 +16,7 @@ with a persistent SQLite scan history.
 ```
 
 **Target instance (yours):** `Nginx-1`, 512 MB / 2 vCPU / 20 GB, region
-`ap-southeast-1` (Singapore), public IP **13.250.63.211**.
+`ap-southeast-1` (Singapore), public IP **<YOUR_INSTANCE_IP>**.
 
 ---
 
@@ -38,20 +38,20 @@ terminal, connect with the default key you downloaded
 
 ```bash
 chmod 600 LightsailDefaultKey-ap-southeast-1.pem   # SSH refuses world-readable keys
-ssh -i LightsailDefaultKey-ap-southeast-1.pem bitnami@13.250.63.211
+ssh -i LightsailDefaultKey-ap-southeast-1.pem bitnami@<YOUR_INSTANCE_IP>
 ```
 
 If you've moved the key to `~/.ssh/` (recommended):
 
 ```bash
-ssh -i ~/.ssh/LightsailDefaultKey-ap-southeast-1.pem admin@13.250.63.211
+ssh -i ~/.ssh/LightsailDefaultKey-ap-southeast-1.pem admin@<YOUR_INSTANCE_IP>
 ```
 
 **Windows PowerShell** (OpenSSH checks NTFS ACLs, not chmod — tighten them once):
 
 ```powershell
 icacls .\LightsailDefaultKey-ap-southeast-1.pem /inheritance:r /grant:r "$($env:USERNAME):(R)"
-ssh -i .\LightsailDefaultKey-ap-southeast-1.pem bitnami@13.250.63.211
+ssh -i .\LightsailDefaultKey-ap-southeast-1.pem bitnami@<YOUR_INSTANCE_IP>
 ```
 
 > Keep the `.pem` private — store it outside the repo (e.g. `~/.ssh/`). It's
@@ -91,7 +91,7 @@ sudo systemctl enable --now docker
 exit                                 # log out/in so the group takes effect
 ```
 
-Reconnect (`ssh bitnami@13.250.63.211`), then `docker ps` should work.
+Reconnect (`ssh bitnami@<YOUR_INSTANCE_IP>`), then `docker ps` should work.
 
 ---
 
@@ -121,7 +121,7 @@ restarts and redeploys.
 Create an **A record** for your subdomain → the instance IP:
 
 ```
-ronway-api.bpxai.com.   A   13.250.63.211
+ronway-api.bpxai.com.   A   <YOUR_INSTANCE_IP>
 ```
 
 (Optionally also an AAAA record to the IPv6 shown in the Lightsail console.)

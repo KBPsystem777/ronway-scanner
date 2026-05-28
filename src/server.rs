@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -46,12 +47,16 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT_MAX_REQUESTS: usize = 10;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(120);
+/// Maximum number of scans running simultaneously across all clients.
+/// Prevents a LinkedIn-style traffic spike from exhausting outbound connections.
+const MAX_CONCURRENT_SCANS: usize = 20;
 
-/// Browser origins permitted to call the API. Production + the two
-/// common Next.js / Vite dev ports.
+/// Browser origins permitted to call the API. Production origins + the
+/// two common Next.js / Vite dev ports.
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://bpxai.com",
     "https://www.bpxai.com",
+    "https://ronway-api.bpxai.com",
     "http://localhost:3000",
     "http://localhost:5173",
 ];
@@ -60,6 +65,7 @@ const ALLOWED_ORIGINS: &[&str] = &[
 #[derive(Clone)]
 pub struct AppState {
     limiter: Arc<Mutex<RateLimiter>>,
+    scan_slots: Arc<Semaphore>,
     store: ScanStore,
 }
 
@@ -76,6 +82,7 @@ impl AppState {
                 RATE_LIMIT_MAX_REQUESTS,
                 RATE_LIMIT_WINDOW,
             ))),
+            scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS)),
             store,
         }
     }
@@ -271,6 +278,14 @@ async fn scan_handler(
     }
 
     let (host, port) = validate_target(&req.target, req.port)?;
+
+    // Acquire a scan slot — rejects immediately if MAX_CONCURRENT_SCANS are
+    // already running. try_acquire avoids queuing callers behind a busy server.
+    let _slot = state
+        .scan_slots
+        .try_acquire()
+        .map_err(|_| ApiError::ServerBusy)?;
+
     info!("scan request {} -> {}:{}", client_ip, host, port);
 
     let scan = RonwayScanner::scan_with_port(&host, port);
@@ -622,6 +637,7 @@ impl RateLimiter {
 pub enum ApiError {
     InvalidTarget(String),
     RateLimited,
+    ServerBusy,
     ScanTimeout,
     Internal(String),
 }
@@ -651,6 +667,14 @@ impl IntoResponse for ApiError {
                     "rate limit: {} requests per {} seconds",
                     RATE_LIMIT_MAX_REQUESTS,
                     RATE_LIMIT_WINDOW.as_secs()
+                ),
+            ),
+            ApiError::ServerBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_busy",
+                format!(
+                    "server is handling {} concurrent scans; retry shortly",
+                    MAX_CONCURRENT_SCANS
                 ),
             ),
             ApiError::ScanTimeout => (

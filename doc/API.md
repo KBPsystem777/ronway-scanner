@@ -3,7 +3,7 @@
 **Base URL:** `https://ronway-api.bpxai.com`
 
 **Rate limit:** 10 requests/min per IP (sliding window)  
-**CORS allowed origins:** `https://bpxai.com`, `https://www.bpxai.com`, `http://localhost:3000`, `http://localhost:5173`
+**CORS allowed origins:** `https://bpxai.com`, `https://www.bpxai.com`, `https://ronway-api.bpxai.com`, `http://localhost:3000`, `http://localhost:5173`
 
 ---
 
