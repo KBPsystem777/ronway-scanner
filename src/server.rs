@@ -22,7 +22,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -103,6 +103,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/scan", post(scan_handler))
+        .route("/api/scans", get(list_scans_handler))
+        .route("/api/scans/:domain", get(scans_by_domain_handler))
+        .route("/api/sites", get(sites_handler))
         .layer(
             // `log_requests` is outermost so it records every request —
             // including CORS preflights short-circuited by the cors layer.
@@ -258,6 +261,67 @@ async fn scan_handler(
     state.store.record(client_ip, &report).await;
 
     Ok(Json(PublicScanReport::from_report(&report)))
+}
+
+// ─── Scan history / aggregation ─────────────────────────────────────────────
+
+/// Default and ceiling for how many rows a history endpoint will return.
+const HISTORY_DEFAULT_LIMIT: i64 = 50;
+const HISTORY_MAX_LIMIT: i64 = 500;
+
+#[derive(Deserialize)]
+struct ListParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(HISTORY_DEFAULT_LIMIT).clamp(1, HISTORY_MAX_LIMIT)
+}
+
+/// `GET /api/scans?limit=&offset=` — every scan, newest first.
+async fn list_scans_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<crate::store::ScanSummary>>, ApiError> {
+    let limit = clamp_limit(params.limit);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let scans = state
+        .store
+        .list_scans(limit, offset)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(scans))
+}
+
+/// `GET /api/scans/:domain` — scan history for one site, newest first.
+async fn scans_by_domain_handler(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<crate::store::ScanSummary>>, ApiError> {
+    let limit = clamp_limit(params.limit);
+    let scans = state
+        .store
+        .list_scans_for_domain(&domain, limit)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(scans))
+}
+
+/// `GET /api/sites?limit=` — per-site rollup (scan count, first/last seen,
+/// latest score), most-scanned first.
+async fn sites_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<crate::store::SiteAggregate>>, ApiError> {
+    let limit = clamp_limit(params.limit);
+    let sites = state
+        .store
+        .site_aggregates(limit)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(sites))
 }
 
 /// Maximum number of remediation-action headlines exposed in the free tier.
@@ -537,6 +601,15 @@ pub enum ApiError {
     InvalidTarget(String),
     RateLimited,
     ScanTimeout,
+    Internal(String),
+}
+
+impl ApiError {
+    /// Map an internal error to a 500 without leaking details to the client.
+    fn internal(e: impl std::fmt::Display) -> Self {
+        warn!("internal error: {}", e);
+        ApiError::Internal("internal server error".into())
+    }
 }
 
 #[derive(Serialize)]
@@ -563,6 +636,7 @@ impl IntoResponse for ApiError {
                 "scan_timeout",
                 format!("scan exceeded {} seconds", SCAN_TIMEOUT.as_secs()),
             ),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m),
         };
         (
             status,

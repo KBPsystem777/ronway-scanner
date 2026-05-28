@@ -192,6 +192,25 @@ async fn scan_rate_limit_kicks_in_after_10_requests() {
 }
 
 #[tokio::test]
+async fn history_endpoints_return_empty_array_when_store_disabled() {
+    let base = spawn_server().await;
+    let c = client();
+
+    for path in ["/api/scans", "/api/sites", "/api/scans/example.com"] {
+        let resp = c.get(format!("{}{}", base, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{} should be 200", path);
+        let body: Value = resp.json().await.unwrap();
+        assert!(body.is_array(), "{} should return a JSON array", path);
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            0,
+            "{} should be empty with persistence disabled",
+            path
+        );
+    }
+}
+
+#[tokio::test]
 #[ignore = "makes real outbound HTTPS connection; run with `cargo test -- --ignored`"]
 async fn scan_returns_full_report_for_real_target() {
     let base = spawn_server().await;

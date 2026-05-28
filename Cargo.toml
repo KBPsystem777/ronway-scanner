@@ -32,7 +32,7 @@ printpdf = "0.7"
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 
 [dev-dependencies]
 rcgen = "0.13"
