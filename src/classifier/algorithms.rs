@@ -38,43 +38,29 @@ impl AlgorithmClassifier {
                 false,
                 "Classical only but forward secret — transitionally safe",
             ),
-            _ => (false, "Unknown key exchange algorithm — manual review required"),
+            _ => (
+                false,
+                "Unknown key exchange algorithm — manual review required",
+            ),
         }
     }
 
     pub fn is_signature_algorithm_vulnerable(algorithm: &str) -> (bool, &'static str) {
         match algorithm.trim() {
-            "sha1WithRSAEncryption" => (
-                true,
-                "SHA-1 collision vulnerable + RSA quantum vulnerable",
-            ),
-            "sha256WithRSAEncryption" => {
-                (true, "RSA quantum vulnerable via Shor's Algorithm")
+            "sha1WithRSAEncryption" => {
+                (true, "SHA-1 collision vulnerable + RSA quantum vulnerable")
             }
-            "sha384WithRSAEncryption" => {
-                (true, "RSA quantum vulnerable via Shor's Algorithm")
-            }
-            "sha512WithRSAEncryption" => {
-                (true, "RSA quantum vulnerable via Shor's Algorithm")
-            }
-            "ecdsa-with-SHA256" => {
-                (true, "ECDSA quantum vulnerable via Shor's Algorithm")
-            }
-            "ecdsa-with-SHA384" => {
-                (true, "ECDSA quantum vulnerable via Shor's Algorithm")
-            }
-            "ecdsa-with-SHA512" => {
-                (true, "ECDSA quantum vulnerable via Shor's Algorithm")
-            }
-            "id-dsa-with-sha1" => {
-                (true, "DSA broken classically and quantum vulnerable")
-            }
+            "sha256WithRSAEncryption" => (true, "RSA quantum vulnerable via Shor's Algorithm"),
+            "sha384WithRSAEncryption" => (true, "RSA quantum vulnerable via Shor's Algorithm"),
+            "sha512WithRSAEncryption" => (true, "RSA quantum vulnerable via Shor's Algorithm"),
+            "ecdsa-with-SHA256" => (true, "ECDSA quantum vulnerable via Shor's Algorithm"),
+            "ecdsa-with-SHA384" => (true, "ECDSA quantum vulnerable via Shor's Algorithm"),
+            "ecdsa-with-SHA512" => (true, "ECDSA quantum vulnerable via Shor's Algorithm"),
+            "id-dsa-with-sha1" => (true, "DSA broken classically and quantum vulnerable"),
             "id-ML-DSA-44" => (false, "NIST FIPS 204 ML-DSA post-quantum signature"),
             "id-ML-DSA-65" => (false, "NIST FIPS 204 ML-DSA post-quantum signature"),
             "id-ML-DSA-87" => (false, "NIST FIPS 204 ML-DSA post-quantum signature"),
-            "id-slh-dsa-sha2-128s" => {
-                (false, "NIST FIPS 205 SLH-DSA post-quantum signature")
-            }
+            "id-slh-dsa-sha2-128s" => (false, "NIST FIPS 205 SLH-DSA post-quantum signature"),
             "Ed25519" => (false, "Classical only — transitionally safe"),
             "Ed448" => (false, "Classical only — transitionally safe"),
             _ => (
@@ -106,10 +92,7 @@ impl AlgorithmClassifier {
             return (true, "MD5 collision vulnerable");
         }
         if c.contains("SHA1") {
-            return (
-                true,
-                "SHA-1 collision vulnerable (not SHA-256/384/512)",
-            );
+            return (true, "SHA-1 collision vulnerable (not SHA-256/384/512)");
         }
         if c.contains("_CBC") {
             return (true, "CBC mode vulnerable to BEAST/POODLE attacks");
@@ -141,38 +124,17 @@ impl VulnerabilityDatabase {
     ) -> Vec<Vulnerability> {
         let mut vulns: Vec<Vulnerability> = Vec::new();
 
+        // A probe that didn't return a finding is an *operational* failure
+        // (host down, port closed, not TLS), not a cryptographic weakness —
+        // so it is intentionally NOT recorded as a vulnerability and does not
+        // contribute to the risk score. The orchestrator flags a fully
+        // unreachable scan as `RiskLevel::Unknown` instead.
         if let Some(t) = tls {
             Self::collect_tls(t, &mut vulns);
-        } else {
-            vulns.push(Vulnerability {
-                id: "TLS_SCAN_FAILED".into(),
-                title: "TLS scan failed".into(),
-                description:
-                    "RonwayScanner could not complete a TLS handshake with the target. \
-                     The endpoint may not be reachable or may not speak TLS on the scanned port."
-                        .into(),
-                severity: RiskLevel::High,
-                nist_reference: "NIST SP 800-52 Rev 2".into(),
-                cvss_equivalent: 5.0,
-            });
         }
-
         if let Some(c) = cert {
             Self::collect_cert(c, &mut vulns);
-        } else {
-            vulns.push(Vulnerability {
-                id: "CERT_SCAN_FAILED".into(),
-                title: "Certificate scan failed".into(),
-                description:
-                    "RonwayScanner could not retrieve or parse the X.509 certificate. \
-                     Without a certificate the post-quantum posture cannot be fully assessed."
-                        .into(),
-                severity: RiskLevel::High,
-                nist_reference: "NIST SP 800-52 Rev 2".into(),
-                cvss_equivalent: 5.0,
-            });
         }
-
         if let Some(h) = http {
             Self::collect_http(h, &mut vulns);
         }
@@ -202,10 +164,9 @@ impl VulnerabilityDatabase {
                         "TLS 1.2 accepted as highest version ({})",
                         t.protocol_version
                     ),
-                    description:
-                        "TLS 1.2 permits RSA key exchange and other quantum-vulnerable \
+                    description: "TLS 1.2 permits RSA key exchange and other quantum-vulnerable \
                          primitives. TLS 1.3 should be the only enabled version."
-                            .into(),
+                        .into(),
                     severity: RiskLevel::Medium,
                     nist_reference: "RFC 8446 (TLS 1.3)".into(),
                     cvss_equivalent: 5.3,
@@ -213,8 +174,7 @@ impl VulnerabilityDatabase {
             }
         }
 
-        let (kx_vuln, kx_reason) =
-            AlgorithmClassifier::is_key_exchange_vulnerable(&t.key_exchange);
+        let (kx_vuln, kx_reason) = AlgorithmClassifier::is_key_exchange_vulnerable(&t.key_exchange);
         if kx_vuln {
             let kx_upper = t.key_exchange.to_ascii_uppercase();
             let id = match kx_upper.as_str() {
@@ -236,8 +196,7 @@ impl VulnerabilityDatabase {
             });
         }
 
-        let (cs_vuln, cs_reason) =
-            AlgorithmClassifier::is_cipher_suite_vulnerable(&t.cipher_suite);
+        let (cs_vuln, cs_reason) = AlgorithmClassifier::is_cipher_suite_vulnerable(&t.cipher_suite);
         if cs_vuln {
             let cs_upper = t.cipher_suite.to_ascii_uppercase();
             let (id, severity, cvss) = if cs_upper.contains("NULL") {
@@ -304,10 +263,9 @@ impl VulnerabilityDatabase {
             vulns.push(Vulnerability {
                 id: "RSA_CERTIFICATE".into(),
                 title: format!("RSA certificate detected ({})", c.key_algorithm),
-                description:
-                    "RSA certificates are broken by Shor's Algorithm on a sufficiently \
+                description: "RSA certificates are broken by Shor's Algorithm on a sufficiently \
                      large quantum computer. Plan migration to ML-DSA-65."
-                        .into(),
+                    .into(),
                 severity: RiskLevel::High,
                 nist_reference: "NIST FIPS 204 (ML-DSA)".into(),
                 cvss_equivalent: 7.4,
@@ -316,10 +274,9 @@ impl VulnerabilityDatabase {
             vulns.push(Vulnerability {
                 id: "ECDSA_CERTIFICATE".into(),
                 title: format!("ECDSA certificate detected ({})", c.key_algorithm),
-                description:
-                    "ECDSA signatures are broken by Shor's Algorithm. Plan migration to \
+                description: "ECDSA signatures are broken by Shor's Algorithm. Plan migration to \
                      ML-DSA-65 from FIPS 204."
-                        .into(),
+                    .into(),
                 severity: RiskLevel::High,
                 nist_reference: "NIST FIPS 204 (ML-DSA)".into(),
                 cvss_equivalent: 7.0,

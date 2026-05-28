@@ -27,10 +27,7 @@ pub struct ScanReport {
 
 impl ScanReport {
     pub fn is_critical(&self) -> bool {
-        matches!(
-            self.risk_score.level,
-            RiskLevel::Critical | RiskLevel::High
-        )
+        matches!(self.risk_score.level, RiskLevel::Critical | RiskLevel::High)
     }
 
     pub fn vulnerability_count(&self) -> usize {
@@ -39,5 +36,10 @@ impl ScanReport {
 
     pub fn has_harvest_risk(&self) -> bool {
         self.risk_score.harvest_risk
+    }
+
+    /// True when no probe reached the target — the scan could not be graded.
+    pub fn is_unreachable(&self) -> bool {
+        self.tls.is_none() && self.certificate.is_none() && self.http.is_none()
     }
 }

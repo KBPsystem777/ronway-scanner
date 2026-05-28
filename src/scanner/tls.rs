@@ -1,261 +1,223 @@
-use std::io::ErrorKind;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+//! Phase 6: TLS scanner core.
+//!
+//! Opens a rustls connection to a remote target with a 10-second timeout,
+//! extracts the negotiated protocol version / cipher suite / key exchange,
+//! and exposes the peer's leaf-certificate DER bytes so `CertScanner`
+//! (Phase 7) can analyse the same handshake without a second connection.
+//!
+//! Certificate verification is intentionally bypassed — the scanner exists
+//! to *find* expired or self-signed certs, so the handshake must succeed
+//! against deliberately broken targets. Trust decisions are reported via
+//! the `CertFinding` instead.
+
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::version::{TLS12, TLS13};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
-use tokio::time::timeout;
-use tracing::{debug, warn};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, NamedGroup, ProtocolVersion,
+    SignatureScheme, SupportedCipherSuite,
+};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::classifier::algorithms::AlgorithmClassifier;
 use crate::models::finding::TlsFinding;
 
-const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_PORT: u16 = 443;
+pub const TIMEOUT_SECS: u64 = 10;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TlsScanError {
+    #[error("connection to {host}:{port} timed out after {secs}s")]
+    Timeout { host: String, port: u16, secs: u64 },
+
+    #[error("invalid hostname for SNI: {0}")]
+    InvalidHostname(String),
+
+    #[error("TCP connect to {host}:{port} failed: {source}")]
+    TcpConnect {
+        host: String,
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("TLS handshake with {host}:{port} failed: {source}")]
+    Handshake {
+        host: String,
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsScanResult {
+    pub finding: TlsFinding,
+    pub peer_cert_der: Option<Vec<u8>>,
+}
 
 pub struct TlsScanner;
 
 impl TlsScanner {
-    pub async fn scan(host: &str, port: u16) -> Result<TlsFinding> {
-        debug!("starting TLS scan for {}:{}", host, port);
+    pub async fn scan(host: &str, port: u16) -> Result<TlsScanResult, TlsScanError> {
+        ensure_crypto_provider();
 
-        let tls13 = run_attempt(host.to_string(), port, AttemptVersion::Tls13).await;
-        let tls12 = run_attempt(host.to_string(), port, AttemptVersion::Tls12).await;
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|_| TlsScanError::InvalidHostname(host.to_string()))?;
 
-        match (tls13, tls12) {
-            (Ok(r13), Ok(_)) => Ok(build_finding(&r13, true)),
-            (Ok(r13), Err(e12)) => {
-                debug!("TLS 1.2 attempt failed (may be TLS 1.3 only): {}", e12);
-                Ok(build_finding(&r13, false))
-            }
-            (Err(e13), Ok(r12)) => {
-                debug!("TLS 1.3 attempt failed, server only offers TLS 1.2: {}", e13);
-                Ok(build_finding(&r12, true))
-            }
-            (Err(e13), Err(e12)) => {
-                warn!("both TLS attempts failed (1.3: {} | 1.2: {})", e13, e12);
-                Err(e13)
-            }
-        }
+        let timeout = Duration::from_secs(TIMEOUT_SECS);
+
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+            .await
+            .map_err(|_| TlsScanError::Timeout {
+                host: host.to_string(),
+                port,
+                secs: TIMEOUT_SECS,
+            })?
+            .map_err(|source| TlsScanError::TcpConnect {
+                host: host.to_string(),
+                port,
+                source,
+            })?;
+
+        let config = build_permissive_client_config();
+        let connector = TlsConnector::from(Arc::new(config));
+
+        let tls = tokio::time::timeout(timeout, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| TlsScanError::Timeout {
+                host: host.to_string(),
+                port,
+                secs: TIMEOUT_SECS,
+            })?
+            .map_err(|source| TlsScanError::Handshake {
+                host: host.to_string(),
+                port,
+                source,
+            })?;
+
+        let (_, conn) = tls.get_ref();
+        Ok(inspect_connection(conn))
     }
 }
 
-#[derive(Clone, Copy)]
-enum AttemptVersion {
-    Tls13,
-    Tls12,
-}
-
-static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&TLS13];
-static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&TLS12];
-
-impl AttemptVersion {
-    fn versions(self) -> &'static [&'static rustls::SupportedProtocolVersion] {
-        match self {
-            Self::Tls13 => TLS13_ONLY,
-            Self::Tls12 => TLS12_ONLY,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Tls13 => "TLS 1.3",
-            Self::Tls12 => "TLS 1.2",
-        }
-    }
-}
-
-struct HandshakeResult {
-    protocol_version: String,
-    cipher_suite: String,
-    key_exchange: String,
-}
-
-async fn run_attempt(
-    host: String,
-    port: u16,
-    version: AttemptVersion,
-) -> Result<HandshakeResult> {
-    let label = version.label();
-    let join = tokio::task::spawn_blocking(move || perform_handshake(&host, port, version));
-
-    let inner = timeout(SCAN_TIMEOUT, join)
-        .await
-        .map_err(|_| anyhow!("{} connection timed out", label))?
-        .map_err(|e| anyhow!("{} task failed: {}", label, e))?;
-
-    inner.with_context(|| format!("{} attempt failed", label))
-}
-
-fn perform_handshake(
-    host: &str,
-    port: u16,
-    version: AttemptVersion,
-) -> Result<HandshakeResult> {
-    debug!("attempting {} handshake with {}:{}", version.label(), host, port);
-
-    let provider = ensure_default_provider();
-    let verifier = Arc::new(AcceptAnyServerCert {
-        provider: provider.clone(),
-    });
-
-    let config = ClientConfig::builder_with_protocol_versions(version.versions())
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| anyhow!("invalid hostname '{}': {}", host, e))?;
-
-    let mut conn = ClientConnection::new(Arc::new(config), server_name)
-        .context("failed to construct TLS client")?;
-
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| anyhow!("domain not found: {}: {}", host, e))?
-        .next()
-        .ok_or_else(|| anyhow!("domain not found: {}: no addresses resolved", host))?;
-
-    let mut sock = TcpStream::connect_timeout(&addr, SCAN_TIMEOUT).map_err(|e| match e.kind() {
-        ErrorKind::ConnectionRefused => anyhow!("connection refused: {}:{}", host, port),
-        ErrorKind::TimedOut => anyhow!("connection timed out: {}:{}", host, port),
-        _ => anyhow!("connection failed: {}: {}", host, e),
-    })?;
-    sock.set_read_timeout(Some(SCAN_TIMEOUT))?;
-    sock.set_write_timeout(Some(SCAN_TIMEOUT))?;
-
-    conn.complete_io(&mut sock).map_err(|e| match e.kind() {
-        ErrorKind::TimedOut => anyhow!("TLS handshake timed out"),
-        _ => anyhow!("TLS handshake failed: {}", e),
-    })?;
-
-    let protocol_version = conn
-        .protocol_version()
-        .map(format_protocol_version)
-        .ok_or_else(|| anyhow!("no protocol version negotiated"))?;
+fn inspect_connection(conn: &ClientConnection) -> TlsScanResult {
+    let protocol_version = format_protocol_version(conn.protocol_version());
+    let protocol_vulnerable = AlgorithmClassifier::is_tls_version_vulnerable(&protocol_version);
 
     let cipher_suite = conn
         .negotiated_cipher_suite()
-        .map(|s| format!("{:?}", s.suite()))
-        .ok_or_else(|| anyhow!("no cipher suite negotiated"))?;
+        .map(cipher_suite_name)
+        .unwrap_or_else(|| "unknown".to_string());
+    let (cipher_vulnerable, _) = AlgorithmClassifier::is_cipher_suite_vulnerable(&cipher_suite);
 
-    let key_exchange = match conn.negotiated_key_exchange_group() {
-        Some(g) => named_group_to_kx(&format!("{:?}", g.name())).to_string(),
-        None => key_exchange_from_cipher(&cipher_suite).to_string(),
+    let key_exchange = conn
+        .negotiated_key_exchange_group()
+        .map(|g| kx_group_name(g.name()))
+        .unwrap_or_else(|| derive_kx_from_cipher(&cipher_suite));
+    let (key_exchange_vulnerable, _) =
+        AlgorithmClassifier::is_key_exchange_vulnerable(&key_exchange);
+
+    let peer_cert_der = conn
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .map(|cert| cert.as_ref().to_vec());
+
+    let finding = TlsFinding {
+        protocol_version,
+        protocol_vulnerable,
+        cipher_suite,
+        cipher_vulnerable,
+        key_exchange,
+        key_exchange_vulnerable,
+        compression: "NULL".to_string(),
+        compression_vulnerable: false,
     };
 
-    debug!(
-        "{} handshake ok: {} / {} / kx={}",
-        version.label(),
-        protocol_version,
-        cipher_suite,
-        key_exchange
-    );
-
-    Ok(HandshakeResult {
-        protocol_version,
-        cipher_suite,
-        key_exchange,
-    })
-}
-
-fn ensure_default_provider() -> Arc<CryptoProvider> {
-    if let Some(p) = CryptoProvider::get_default() {
-        return p.clone();
+    TlsScanResult {
+        finding,
+        peer_cert_der,
     }
-    let provider = rustls::crypto::ring::default_provider();
-    let _ = provider.install_default();
-    CryptoProvider::get_default()
-        .expect("crypto provider installed above")
-        .clone()
 }
 
-fn format_protocol_version(v: rustls::ProtocolVersion) -> String {
-    use rustls::ProtocolVersion;
+fn format_protocol_version(v: Option<ProtocolVersion>) -> String {
     match v {
-        ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
-        ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
-        ProtocolVersion::TLSv1_1 => "TLSv1.1".to_string(),
-        ProtocolVersion::TLSv1_0 => "TLSv1.0".to_string(),
-        ProtocolVersion::SSLv3 => "SSLv3".to_string(),
-        ProtocolVersion::SSLv2 => "SSLv2".to_string(),
-        other => format!("{:?}", other),
+        Some(ProtocolVersion::TLSv1_3) => "TLSv1.3".to_string(),
+        Some(ProtocolVersion::TLSv1_2) => "TLSv1.2".to_string(),
+        Some(ProtocolVersion::TLSv1_1) => "TLSv1.1".to_string(),
+        Some(ProtocolVersion::TLSv1_0) => "TLSv1.0".to_string(),
+        Some(ProtocolVersion::SSLv3) => "SSLv3".to_string(),
+        Some(ProtocolVersion::SSLv2) => "SSLv2".to_string(),
+        Some(other) => format!("{:?}", other),
+        None => "unknown".to_string(),
     }
 }
 
-fn named_group_to_kx(name: &str) -> &'static str {
-    let upper = name.to_ascii_uppercase();
-    if upper.contains("MLKEM") {
-        "X25519MLKEM768"
-    } else if upper.starts_with("X25519")
-        || upper.starts_with("X448")
-        || upper.starts_with("SECP")
-        || upper.starts_with("BRAINPOOL")
-    {
-        "ECDHE"
-    } else if upper.starts_with("FFDHE") {
-        "DHE"
+fn cipher_suite_name(suite: SupportedCipherSuite) -> String {
+    let cs = suite.suite();
+    let raw = cs
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| format!("{:?}", cs));
+    // rustls names its TLS 1.3 suites `TLS13_AES_128_GCM_SHA256` etc.,
+    // but the IANA registry calls them `TLS_AES_128_GCM_SHA256`. Reports
+    // and CVE lookups expect the IANA form, so normalise here.
+    if let Some(rest) = raw.strip_prefix("TLS13_") {
+        format!("TLS_{}", rest)
     } else {
-        "ECDHE"
+        raw
     }
 }
 
-fn key_exchange_from_cipher(cipher: &str) -> &'static str {
-    let c = cipher.to_ascii_uppercase();
-    let is_tls13 = c.starts_with("TLS13_")
-        || c.starts_with("TLS_AES_")
-        || c.starts_with("TLS_CHACHA20_");
+fn kx_group_name(group: NamedGroup) -> String {
+    match group {
+        NamedGroup::X25519 => "X25519".to_string(),
+        NamedGroup::secp256r1 | NamedGroup::secp384r1 | NamedGroup::secp521r1 => {
+            "ECDHE".to_string()
+        }
+        NamedGroup::FFDHE2048
+        | NamedGroup::FFDHE3072
+        | NamedGroup::FFDHE4096
+        | NamedGroup::FFDHE6144
+        | NamedGroup::FFDHE8192 => "DHE".to_string(),
+        NamedGroup::X25519MLKEM768 => "X25519MLKEM768".to_string(),
+        NamedGroup::secp256r1MLKEM768 => "secp256r1MLKEM768".to_string(),
+        other => other
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| format!("{:?}", other)),
+    }
+}
 
-    if is_tls13 || c.contains("ECDHE") {
-        "ECDHE"
-    } else if c.contains("_ECDH_") {
-        "ECDH"
-    } else if c.contains("DHE") {
-        "DHE"
-    } else if c.contains("_DH_") {
-        "DH"
-    } else if c.starts_with("TLS_RSA_") {
-        "RSA"
+fn derive_kx_from_cipher(cipher: &str) -> String {
+    let u = cipher.to_ascii_uppercase();
+    if u.contains("ECDHE") {
+        "ECDHE".to_string()
+    } else if u.contains("ECDH_") {
+        "ECDH".to_string()
+    } else if u.contains("DHE") {
+        "DHE".to_string()
+    } else if u.contains("_DH_") {
+        "DH".to_string()
+    } else if u.starts_with("TLS_RSA") {
+        "RSA".to_string()
     } else {
-        "UNKNOWN"
-    }
-}
-
-fn build_finding(primary: &HandshakeResult, accepts_tls12: bool) -> TlsFinding {
-    let protocol_vulnerable = accepts_tls12
-        || AlgorithmClassifier::is_tls_version_vulnerable(&primary.protocol_version);
-    let (cipher_vulnerable, _) =
-        AlgorithmClassifier::is_cipher_suite_vulnerable(&primary.cipher_suite);
-    let (kx_vulnerable, _) =
-        AlgorithmClassifier::is_key_exchange_vulnerable(&primary.key_exchange);
-
-    TlsFinding {
-        protocol_version: primary.protocol_version.clone(),
-        protocol_vulnerable,
-        cipher_suite: primary.cipher_suite.clone(),
-        cipher_vulnerable,
-        key_exchange: primary.key_exchange.clone(),
-        key_exchange_vulnerable: kx_vulnerable,
-        compression: "none".to_string(),
-        compression_vulnerable: false,
+        "unknown".to_string()
     }
 }
 
 #[derive(Debug)]
-struct AcceptAnyServerCert {
-    provider: Arc<CryptoProvider>,
-}
+struct NoVerifier;
 
-impl ServerCertVerifier for AcceptAnyServerCert {
+impl ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
@@ -264,37 +226,54 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
     }
+}
+
+fn build_permissive_client_config() -> ClientConfig {
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth()
+}
+
+static CRYPTO_INIT: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 #[cfg(test)]
@@ -302,46 +281,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_formats_tls13() {
+    fn format_protocol_version_known_versions() {
         assert_eq!(
-            format_protocol_version(rustls::ProtocolVersion::TLSv1_3),
+            format_protocol_version(Some(ProtocolVersion::TLSv1_3)),
             "TLSv1.3"
         );
-    }
-
-    #[test]
-    fn named_group_x25519_maps_to_ecdhe() {
-        assert_eq!(named_group_to_kx("X25519"), "ECDHE");
-    }
-
-    #[test]
-    fn named_group_mlkem_maps_to_hybrid() {
-        assert_eq!(named_group_to_kx("X25519MLKEM768"), "X25519MLKEM768");
-    }
-
-    #[test]
-    fn named_group_ffdhe_maps_to_dhe() {
-        assert_eq!(named_group_to_kx("FFDHE2048"), "DHE");
-    }
-
-    #[test]
-    fn cipher_tls13_implies_ecdhe() {
-        assert_eq!(key_exchange_from_cipher("TLS_AES_256_GCM_SHA384"), "ECDHE");
-    }
-
-    #[test]
-    fn cipher_tls_rsa_implies_rsa() {
         assert_eq!(
-            key_exchange_from_cipher("TLS_RSA_WITH_AES_128_CBC_SHA"),
-            "RSA"
+            format_protocol_version(Some(ProtocolVersion::TLSv1_2)),
+            "TLSv1.2"
+        );
+        assert_eq!(
+            format_protocol_version(Some(ProtocolVersion::TLSv1_0)),
+            "TLSv1.0"
+        );
+        assert_eq!(
+            format_protocol_version(Some(ProtocolVersion::SSLv3)),
+            "SSLv3"
         );
     }
 
     #[test]
-    fn cipher_ecdhe_extracted() {
+    fn format_protocol_version_none_is_unknown() {
+        assert_eq!(format_protocol_version(None), "unknown");
+    }
+
+    #[test]
+    fn derive_kx_recognises_ecdhe() {
         assert_eq!(
-            key_exchange_from_cipher("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"),
+            derive_kx_from_cipher("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"),
             "ECDHE"
         );
+    }
+
+    #[test]
+    fn derive_kx_recognises_dhe() {
+        assert_eq!(
+            derive_kx_from_cipher("TLS_DHE_RSA_WITH_AES_128_GCM_SHA256"),
+            "DHE"
+        );
+    }
+
+    #[test]
+    fn derive_kx_recognises_rsa_only() {
+        assert_eq!(derive_kx_from_cipher("TLS_RSA_WITH_AES_128_CBC_SHA"), "RSA");
+    }
+
+    #[test]
+    fn derive_kx_unknown_for_tls13_cipher_names() {
+        assert_eq!(derive_kx_from_cipher("TLS_AES_256_GCM_SHA384"), "unknown");
+        assert_eq!(
+            derive_kx_from_cipher("TLS_CHACHA20_POLY1305_SHA256"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn kx_group_x25519_classifies_as_safe() {
+        let name = kx_group_name(NamedGroup::X25519);
+        assert_eq!(name, "X25519");
+        let (vuln, _) = AlgorithmClassifier::is_key_exchange_vulnerable(&name);
+        assert!(!vuln);
+    }
+
+    #[test]
+    fn kx_group_p256_classifies_as_ecdhe_vulnerable() {
+        let name = kx_group_name(NamedGroup::secp256r1);
+        assert_eq!(name, "ECDHE");
+        let (vuln, _) = AlgorithmClassifier::is_key_exchange_vulnerable(&name);
+        assert!(vuln);
+    }
+
+    #[test]
+    fn kx_group_ffdhe_classifies_as_dhe_vulnerable() {
+        let name = kx_group_name(NamedGroup::FFDHE2048);
+        assert_eq!(name, "DHE");
+        let (vuln, _) = AlgorithmClassifier::is_key_exchange_vulnerable(&name);
+        assert!(vuln);
+    }
+
+    #[test]
+    fn kx_group_pq_hybrid_classifies_as_safe() {
+        let name = kx_group_name(NamedGroup::X25519MLKEM768);
+        assert_eq!(name, "X25519MLKEM768");
+        let (vuln, _) = AlgorithmClassifier::is_key_exchange_vulnerable(&name);
+        assert!(!vuln);
+    }
+
+    #[tokio::test]
+    async fn scan_invalid_hostname_returns_error() {
+        let res = TlsScanner::scan("invalid hostname with spaces", 443).await;
+        assert!(matches!(res, Err(TlsScanError::InvalidHostname(_))));
     }
 }

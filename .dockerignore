@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+doc/
+templates/
+*.db
+*.db-shm
+*.db-wal
+*.pdf
+*.html
+report.*
+*.md
+.cargo/

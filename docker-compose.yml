@@ -1,0 +1,25 @@
+# Run the RonwayScanner API on a single host (e.g. an EC2 instance):
+#
+#   docker compose up -d --build
+#   curl http://localhost:3001/api/health
+#
+# Scan history is kept in the named volume `ronway_data` (backed by the
+# instance's disk / EBS), so it survives `docker compose down` and redeploys.
+# To inspect it:  docker compose exec ronway sh -c 'ls -la /data'
+
+services:
+  ronway:
+    build: .
+    image: ronway-scanner:latest
+    container_name: ronway
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      RUST_LOG: "ronway_scanner=info"
+      RONWAY_DB_PATH: "/data/ronway.db"
+    volumes:
+      - ronway_data:/data
+
+volumes:
+  ronway_data:

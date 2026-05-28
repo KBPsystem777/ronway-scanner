@@ -7,6 +7,9 @@ pub enum RiskLevel {
     Medium,
     Low,
     Pass,
+    /// The scan could not reach the endpoint, so no posture could be graded.
+    /// Distinct from `Pass` so an unreachable host is never read as "secure".
+    Unknown,
 }
 
 impl RiskLevel {
@@ -27,6 +30,7 @@ impl RiskLevel {
             RiskLevel::Medium => "Medium",
             RiskLevel::Low => "Low",
             RiskLevel::Pass => "Pass",
+            RiskLevel::Unknown => "Incomplete",
         }
     }
 
@@ -37,6 +41,7 @@ impl RiskLevel {
             RiskLevel::Medium => "#ca8a04",
             RiskLevel::Low => "#65a30d",
             RiskLevel::Pass => "#16a34a",
+            RiskLevel::Unknown => "#6b7280",
         }
     }
 }

@@ -67,27 +67,36 @@ ronway monitor --target bsp.gov.ph --interval 1440
 
 ```
 ronway scan
-  --target <domain>       Domain to scan (required)
+  --target, -t <domain>   Domain to scan (required)
   --port <port>           Default: 443
-  --output <format>       terminal (default) | json | html | pdf
-  --out-file <path>       Output file path
-  --audience <type>       technical (default) | ciso
-  --timeout <seconds>     Default: 10
-  --verbose               Show debug output
+  --output <format>       text (default) | json | html | pdf
+  --out-file <path>       Write report to file instead of stdout
+                          (required for --output pdf)
 
 ronway bulk
-  --targets <file>        Text file, one domain per line
-  --output <format>       terminal | json
-  --out-dir <path>        Directory for individual reports
-  --concurrency <n>       Default: 10
+  --targets <file>        Text file, one `host` or `host:port` per line
+                          (lines beginning with `#` are ignored)
+  --output <format>       text (default) | json
+  --concurrency <n>       Default: 8
 
 ronway monitor
-  --target <domain>
+  --target, -t <domain>
+  --port <port>           Default: 443
   --interval <minutes>    Default: 1440 (once per day)
-  --alert-score <n>       Alert if score exceeds threshold (default: 60)
+
+ronway serve
+  --port <port>           Default: 3001 (binds 0.0.0.0)
+                          JSON API: GET /api/health, POST /api/scan
 
 ronway version
 ```
+
+For a step-by-step local terminal walkthrough (build, every command, the
+API server, exit codes, troubleshooting), see [doc/USAGE.md](doc/USAGE.md).
+
+Set `RUST_LOG=debug` (or `info` / `warn`) in the environment to control log
+verbosity — the scanner uses `tracing` and respects the standard level
+syntax.
 
 **CI/CD integration:** `ronway scan` exits with code `1` if the risk score is ≥ 60, making it drop-in compatible with any pipeline that fails on non-zero exit codes.
 

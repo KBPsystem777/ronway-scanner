@@ -1,7 +1,17 @@
 # RonwayScanner — Build Progress
 
-> Status as of 2026-05-27. This document tracks what is built, what is stubbed,
-> and how to verify the work on a clean checkout.
+> Status as of 2026-05-28. The v1 remote-scan product is feature complete:
+> TLS / certificate / HTTP scanning, NIST-PQC classification, additive
+> risk scoring, prioritised remediation, four output formats, and the
+> `scan` / `bulk` / `monitor` / `serve` / `version` CLI surface — all wired
+> into a single `ronway` binary. The `serve` command exposes the same
+> scan engine as a hardened JSON HTTP API for the BPxAI landing page.
+>
+> **New since the last update:** Phase 14 — the HTTP API server
+> ([src/server.rs](../src/server.rs)) with SSRF-safe target validation,
+> per-IP rate limiting, and a restricted CORS allowlist.
+>
+> See [USAGE.md](USAGE.md) for the full local terminal walkthrough.
 
 ---
 
@@ -13,230 +23,178 @@
 | 2 | Data models | Done |
 | 3 | Vulnerability classification database | Done |
 | 4 | Risk scoring engine + unit tests | Done |
-| 5 | Remediation recommendations engine | Not started |
-| 6 | TLS scanner core | Stub |
-| 7 | Certificate parser | Stub |
-| 8 | HTTP headers scanner | Stub |
-| 9 | Main scanner orchestrator (`RonwayScanner::scan`) | Stub |
-| 10 | Report generators (JSON / HTML / PDF) | Stub |
-| 11 | CLI polish (`bulk`, `monitor`, output modes) | Stub |
-| 12 | Tests + README | Partial (unit tests only) |
-| 13 | Final build verification | Pending Phase 5+ |
+| 5 | Remediation recommendations engine | Done |
+| 6 | TLS scanner core | Done |
+| 7 | Certificate parser | Done |
+| 8 | HTTP headers scanner | Done |
+| 9 | Main scanner orchestrator (`RonwayScanner::scan`) | Done |
+| 10 | Report generators (JSON / HTML / PDF) | Done |
+| 11 | CLI polish (`scan`, `bulk`, `monitor`, `version`, output modes) | Done |
+| 12 | Tests + README | Done |
+| 13 | Final build verification | Done |
+| 14 | HTTP API server (`serve`: `/api/scan`, `/api/health`) | Done |
 
 ---
 
 ## What works right now
 
-### Phase 1 — Scaffold
+### Library entry point — `RonwayScanner::scan`
 
-- `cargo build` and `cargo check` succeed against the full dependency tree
-  (tokio, rustls, reqwest, x509-parser, clap, etc.).
-- Binary skeleton: `ronway scan --target <domain>` parses CLI args and
-  prints `Scanning <domain>...` — no real scan yet.
+[src/lib.rs](../src/lib.rs) exposes a single async orchestrator:
 
-### Phase 2 — Data models
+```rust
+let report: ScanReport = RonwayScanner::scan("bsp.gov.ph").await;
+// or
+let report = RonwayScanner::scan_with_port("bsp.gov.ph", 8443).await;
+```
 
-| File | Types |
+The orchestrator:
+
+1. fires the TLS and HTTP scanners concurrently via `tokio::join!`;
+2. derives the `CertFinding` from the TLS scan's `peer_cert_der` (single
+   handshake — no second round-trip to the target);
+3. wraps individual scanner failures into `Option` fields, so a partial
+   scan still produces a coherent `ScanReport` annotated with
+   `TLS_SCAN_FAILED` / `CERT_SCAN_FAILED` sentinels;
+4. classifies, scores, and assembles a prioritised `Vec<Recommendation>`;
+5. flips `quantum_ready` on only when TLS 1.3, a PQC-safe cipher, a PQC
+   key exchange, and a non-quantum-vulnerable cert all line up.
+
+### Phase 6 — TLS scanner core
+
+[src/scanner/tls.rs](../src/scanner/tls.rs) — `TlsScanner::scan(host, port)`
+opens a `tokio-rustls` connection (10-second timeout, permissive cert
+verifier so broken targets still complete the handshake) and returns
+`TlsScanResult { finding, peer_cert_der }`. `TlsScanError` is a typed
+enum (`Timeout` / `InvalidHostname` / `TcpConnect` / `Handshake`).
+Cipher-suite names are normalised to the IANA form
+(`TLS13_AES_256_GCM_SHA384` → `TLS_AES_256_GCM_SHA384`).
+
+### Phase 7 — Certificate parser
+
+[src/scanner/cert.rs](../src/scanner/cert.rs) — `CertScanner::parse_der`
+consumes the DER bytes from Phase 6 and produces a fully populated
+`CertFinding`: subject / issuer, key algorithm (`RSA-{bits}` / `EC {curve}`
+/ `Ed25519` / `ML-DSA-{level}`), signature algorithm (OID → human name),
+validity window with `days_remaining` / `is_expired`, `is_self_signed`,
+and the `ct_logged` flag from SCT extension OID
+`1.3.6.1.4.1.11129.2.4.2`.
+
+### Phase 8 — HTTP headers scanner
+
+[src/scanner/http.rs](../src/scanner/http.rs) — `HttpScanner::scan(host, port)`
+issues one GET via reqwest (rustls-tls backend, 10-second timeout,
+`danger_accept_invalid_certs` so broken certs don't block the header
+scan — they're already graded by Phase 7) and extracts:
+`Strict-Transport-Security` (with `max-age` parsed out), `Content-Security-Policy`
+presence, `X-Frame-Options` value, `Server` value.
+
+### Phase 10 — Report generators
+
+| Reporter | Output |
 |---|---|
-| [src/models/risk.rs](../src/models/risk.rs) | `RiskLevel` enum, `RiskScore` struct |
-| [src/models/finding.rs](../src/models/finding.rs) | `TlsFinding`, `CertFinding`, `HttpFinding`, `Vulnerability`, `Recommendation` |
-| [src/models/report.rs](../src/models/report.rs) | `ScanTarget`, `ScanReport` |
+| [`JsonReporter`](../src/report/json.rs) | Pretty-printed JSON (one-shot `serde_json::to_string_pretty`). |
+| [`HtmlReporter`](../src/report/html.rs) | Self-contained HTML — inline CSS, no JavaScript, no external URLs. |
+| [`PdfReporter`](../src/report/pdf.rs) | A4 portrait PDF built with `printpdf` and Helvetica built-ins. Greedy word-wrap, automatic page breaks. |
 
-All types derive `Serialize` + `Deserialize` so they can be emitted to JSON in
-Phase 10 without rework. `RiskLevel::from_score` maps the 0–100 scale to the
-five risk levels per the spec.
+### Phase 11 — CLI
 
-### Phase 3 — Classifier
+[src/main.rs](../src/main.rs) — clap-derived `Cli` with four subcommands:
 
-[src/classifier/algorithms.rs](../src/classifier/algorithms.rs) exposes two
-pure (side-effect-free) types:
+| Command | What it does |
+|---|---|
+| `scan --target T [--port P] [--output text\|json\|html\|pdf] [--out-file F]` | Single scan. PDF mode requires `--out-file`. |
+| `bulk --targets FILE [--output text\|json] [--concurrency N]` | Reads `host` / `host:port` per line, scans concurrently (default 8 in flight), prints per-target summary. |
+| `monitor --target T [--port P] [--interval MIN]` | Re-scans on an interval and prints when the risk score changes. |
+| `serve [--port P]` | Starts the HTTP API server (default `0.0.0.0:3001`). |
+| `version` | Prints the binary version. |
 
-- **`AlgorithmClassifier`** — answers four questions about a string:
-  - `is_tls_version_vulnerable(&str) -> bool`
-  - `is_key_exchange_vulnerable(&str) -> (bool, &'static str)`
-  - `is_signature_algorithm_vulnerable(&str) -> (bool, &'static str)`
-  - `is_cipher_suite_vulnerable(&str) -> (bool, &'static str)`
-- **`VulnerabilityDatabase::build_vulnerabilities`** — takes
-  `Option<&TlsFinding>`, `Option<&CertFinding>`, `Option<&HttpFinding>`
-  (any scanner may fail) and emits `Vec<Vulnerability>` with stable IDs:
-  `RSA_KEY_EXCHANGE`, `ECDHE_KEY_EXCHANGE`, `DH_KEY_EXCHANGE`,
-  `TLS_LEGACY_VERSION`, `TLS_VERSION_VULNERABLE`,
-  `NULL_CIPHER`, `EXPORT_CIPHER`, `RC4_CIPHER`, `TRIPLE_DES_CIPHER`, `CBC_CIPHER`,
-  `RSA_CERTIFICATE`, `ECDSA_CERTIFICATE`, `RSA_SIGNATURE`, `ECDSA_SIGNATURE`,
-  `SHA1_IN_CHAIN`, `CERT_EXPIRED`, `CERT_SELF_SIGNED`,
-  `NO_HSTS`, `SERVER_HEADER_LEAK`,
-  plus sentinels `TLS_SCAN_FAILED` / `CERT_SCAN_FAILED`.
+Exit codes: `0` if the (worst) risk score is `< 60`, `1` if `>= 60`,
+`2` for setup errors (missing file, bad CLI args, etc.). This matches
+the CI-gate convention in [CLAUDE.md](../CLAUDE.md).
 
-The cipher classifier checks vulnerable patterns **before** safe ones, so
-`AES_128_CBC` correctly flags as CBC-vulnerable rather than being mis-labeled
-safe by the AES_128 rule.
+### Phase 14 — HTTP API server
 
-Nine inline `#[cfg(test)]` tests cover positive and negative cases for each
-classifier function.
+[src/server.rs](../src/server.rs) — `ronway serve` boots an axum server that
+exposes the same scan engine over JSON, so the BPxAI landing page can run
+scans from the browser without shelling out to the binary.
 
-### Phase 4 — Scoring
+| Endpoint | Behaviour |
+|---|---|
+| `GET /api/health` | `200` with `{ "status": "ok", "service": "ronway-scanner", "version": "…" }`. |
+| `POST /api/scan` | Body `{ "target": "example.com", "port": 443 }` → full `ScanReport` JSON (same shape the reporters serialise). |
 
-[src/classifier/scoring.rs](../src/classifier/scoring.rs) exposes
-`RiskScorer` with:
+Server-side guard rails (not negotiable by the client):
 
-- `RiskScorer::calculate(&[Vulnerability]) -> RiskScore` — sums per-ID
-  penalty weights (saturating, capped at 100). Weights match the table in
-  [CLAUDE.md](../CLAUDE.md) exactly (RSA KX +35, ECDHE +30, NULL cipher +40, etc.).
-- `RiskScorer::harvest_risk_present(&[Vulnerability]) -> bool` — true if any
-  RSA / ECDHE / DH key exchange vulnerability is present.
-- `RiskScorer::generate_summary(&RiskScore, target) -> String` — produces the
-  executive-style summary sentence used in reports.
+- **SSRF defence.** `validate_target` strips any scheme/path, then rejects
+  private, loopback, link-local, CGNAT, and reserved IP ranges plus
+  internal-looking hostnames (`localhost`, `*.local`, `*.internal`,
+  `*.lan`, `*.home`, `*.corp`) so the API can't be pointed at internal
+  infrastructure.
+- **Rate limiting.** A per-IP sliding window — 10 scans / 60 s — backed by
+  an in-memory `RateLimiter`, pruned by a background task every 120 s.
+- **30-second wall-clock cap** on each scan (`ApiError::ScanTimeout` → `504`).
+- **CORS allowlist** restricted to the bpxai.com production origins plus
+  the `localhost:3000` / `localhost:5173` dev ports.
 
-[tests/unit/scoring_test.rs](../tests/unit/scoring_test.rs) — eleven tests
-covering empty inputs, individual weights, the harvest-risk flag, every
-`RiskLevel::from_score` boundary, the 100-point cap, and the summary string.
-Wired into [Cargo.toml](../Cargo.toml) via an explicit `[[test]]` target since
-Cargo does not auto-discover tests under `tests/<subdir>/`.
+On startup it prints a banner (listening URL + endpoints) and then a
+morgan-style coloured log line per request — `METHOD PATH STATUS LATENCY IP`
+— emitted at INFO so it's visible by default. `init_tracing` now defaults
+to `warn,ronway_scanner=info` (still overridable via `RUST_LOG`).
 
 ---
 
-## What is still a stub
+## Testing
 
-- [src/scanner/tls.rs](../src/scanner/tls.rs),
-  [src/scanner/cert.rs](../src/scanner/cert.rs),
-  [src/scanner/http.rs](../src/scanner/http.rs),
-  [src/scanner/dns.rs](../src/scanner/dns.rs) — module skeletons only.
-- [src/classifier/recommendations.rs](../src/classifier/recommendations.rs) —
-  empty stub.
-- [src/report/](../src/report/) — JSON / HTML / PDF reporters not implemented.
-- [src/lib.rs](../src/lib.rs) — orchestrator `RonwayScanner::scan` does not exist yet.
-- [src/main.rs](../src/main.rs) — only the `scan --target` arg is wired; no
-  `--output`, `--out-file`, `bulk`, `monitor`, or `version` commands yet.
+Every phase ships inline unit tests plus dedicated integration files
+that drive the public API against an in-process rustls server:
+
+| File | Coverage |
+|---|---|
+| `src/**/*.rs` `#[cfg(test)]` modules | Pure helpers (classifier, scoring, recommendations, TLS group/cipher mapping, HTTP parsing, HTML escaping, PDF text-wrap, etc.). |
+| [tests/unit/scoring_test.rs](../tests/unit/scoring_test.rs) | Risk scoring boundaries, harvest-risk flag, 100-point cap, summary text. |
+| [tests/unit/cert_test.rs](../tests/unit/cert_test.rs) | DER parsing across ECDSA-P256, ECDSA-P384, Ed25519, expired certs, malformed input. |
+| [tests/unit/tls_test.rs](../tests/unit/tls_test.rs) | Real TLS 1.3 handshake against an in-process rcgen server; verifies the DER bytes are passed through to Phase 7. |
+| [tests/unit/http_test.rs](../tests/unit/http_test.rs) | In-process HTTPS server serving controlled response headers. |
+| [tests/unit/orchestrator_test.rs](../tests/unit/orchestrator_test.rs) | Full pipeline against a local HTTPS server + failure-sentinel path. |
+| [tests/unit/report_test.rs](../tests/unit/report_test.rs) | JSON / HTML / PDF rendering of a representative `ScanReport`. |
+| [tests/unit/server_test.rs](../tests/unit/server_test.rs) | In-process axum server: `/api/health`, CORS allow/block, SSRF rejections (localhost / private IP / empty), malformed-JSON `400`, rate-limit `429` after 10 hits. The real-target shape contract is `#[ignore]`d. |
+| [tests/integration/tls_scan_test.rs](../tests/integration/tls_scan_test.rs) | `#[ignore]`d real-network sanity against `example.com`. Run with `cargo test -- --ignored`. |
+
+### How to verify on a fresh checkout
+
+```powershell
+cargo build --release
+cargo test
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+End-to-end smoke tests (require outbound HTTPS):
+
+```powershell
+./target/release/ronway.exe version
+./target/release/ronway.exe scan --target example.com
+./target/release/ronway.exe scan --target example.com --output json
+./target/release/ronway.exe scan --target example.com --output html --out-file report.html
+./target/release/ronway.exe scan --target example.com --output pdf  --out-file report.pdf
+
+# API server (in a second terminal):
+./target/release/ronway.exe serve --port 3001
+# then:  curl http://localhost:3001/api/health
+```
 
 ---
 
-## How to test on this machine
+## What is intentionally **not** in v1
 
-### Prerequisites
-
-The project needs a C/C++ linker. On this workstation that is **MSVC Build
-Tools v14.44.35207** + **Windows SDK 10.0.26100.0**, already installed at:
-
-```
-C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\
-C:\Program Files (x86)\Windows Kits\10\
-```
-
-#### Linker shadowing — fixed
-
-`cargo` invokes `link.exe` by bare name. Git for Windows ships its own GNU
-`link` at `C:\Program Files\Git\usr\bin\link.exe`, which appears earlier on
-PATH and breaks builds with errors like:
-
-```
-error: linking with `link.exe` failed: exit code: 1
-  = note: link: extra operand 'C:\\Users\\Kolee\\...\\build_script_build.exe'
-```
-
-This is fixed in [.cargo/config.toml](../.cargo/config.toml), which pins the
-MSVC linker by absolute path:
-
-```toml
-[target.x86_64-pc-windows-msvc]
-linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
-```
-
-If MSVC is updated and the `14.44.35207` directory disappears, update the
-version number — or run `cargo` from the **"x64 Native Tools Command Prompt
-for VS 2022"** (Start menu), which sets PATH so MSVC's `link.exe` wins on its
-own. Either approach works.
-
-### Step-by-step verification
-
-Run each command from the project root
-(`C:\Users\Kolee\proj\ronway-scanner`).
-
-1. **Confirm the toolchain is alive.**
-
-   ```powershell
-   cargo --version
-   rustc --version
-   ```
-
-   Should report Cargo and rustc from the active toolchain
-   (currently `nightly-x86_64-pc-windows-msvc`).
-
-2. **Compile without linking the test binaries** (fast feedback loop).
-
-   ```powershell
-   cargo check
-   ```
-
-   Expected: `Finished 'dev' profile ... in <N>s`. No errors.
-
-3. **Run the unit tests** (this is the main thing to verify Phase 3 and 4).
-
-   ```powershell
-   cargo test
-   ```
-
-   Expected output ends with:
-
-   ```
-   running 9 tests
-   ... 9 passed; 0 failed (classifier)
-   running 11 tests
-   ... 11 passed; 0 failed (scoring_test)
-   ```
-
-   20 tests total across the library unit tests and the integration test
-   file. All must pass.
-
-4. **Lint and format checks** (CLAUDE.md asks for clean output).
-
-   ```powershell
-   cargo fmt --check
-   cargo clippy --all-targets
-   ```
-
-   `cargo fmt --check` exits 0 if formatting is clean; if not, run
-   `cargo fmt` to fix.
-
-5. **Release build** — confirms the binary still links.
-
-   ```powershell
-   cargo build --release
-   ```
-
-   Produces `target\release\ronway.exe`.
-
-6. **Smoke-test the CLI stub.** Phase 1 only prints a placeholder string;
-   real scanning lands in Phase 6+.
-
-   ```powershell
-   .\target\release\ronway.exe scan --target example.com
-   ```
-
-   Expected: `Scanning example.com...` and exit code 0.
-
-### Running a single test by name
-
-```powershell
-cargo test score_is_capped_at_100
-cargo test classifier::algorithms
-```
-
-### What is **not** runnable yet
-
-These will exist once their phases land — do not try them until then:
-
-```powershell
-# Phase 6+ — real TLS scan
-ronway scan --target bsp.gov.ph
-
-# Phase 10 — output formats
-ronway scan --target bsp.gov.ph --output json
-ronway scan --target bsp.gov.ph --output pdf --out-file report.pdf
-
-# Phase 11 — bulk and monitor
-ronway bulk --targets domains.txt
-ronway monitor --target example.com --interval 1440
-```
+- **Filesystem / dependency scanning.** Per [CLAUDE.md](../CLAUDE.md),
+  local-source scanning is v2.
+- **DNS-record analysis** (CAA / TLSA / DNSSEC).
+  [src/scanner/dns.rs](../src/scanner/dns.rs) is reserved for v2.
+- **OCSP / CRL freshness checks** beyond the `is_expired` flag.
+- **Cipher-suite enumeration** beyond the one selected by the server.
+  RonwayScanner reports what the server *picks*, not the full menu.
 
 ---
 
@@ -244,38 +202,14 @@ ronway monitor --target example.com --interval 1440
 
 ### `cargo test` fails with `link: extra operand ...`
 
-PATH is being read before `.cargo/config.toml` for some reason, or the file
-is missing/typoed. Verify:
-
-```powershell
-Test-Path .cargo\config.toml
-Get-Content .cargo\config.toml
-```
-
-If it exists, double-check that the linker path in it points to a real
-`link.exe`. If MSVC has been updated, the `14.44.35207` directory may have
-been renamed; update the path or run from a Developer Command Prompt.
-
-### `cargo test` is slow
-
-First build after `cargo clean` recompiles ~280 dependency crates (~1 min on
-this machine). Subsequent runs reuse cached artifacts and finish in seconds.
+PATH is being read before `.cargo/config.toml`, or the file is missing.
+See [.cargo/config.toml](../.cargo/config.toml) — it pins the MSVC linker
+to an absolute path. If MSVC has been updated, the `14.44.35207`
+directory may have been renamed; update the path or run from a
+**x64 Native Tools Command Prompt for VS 2022**.
 
 ### `cargo check` fails on a fresh clone
 
-The `.cargo/config.toml` file is committed, so the fix travels with the repo.
-But the path inside it is workstation-specific — anyone else cloning this
-project will need to update the path (or use a Developer Command Prompt).
-This is fine for now since the project is single-developer; revisit before
-publishing.
-
----
-
-## Next phase
-
-**Phase 5 — Remediation recommendations engine.** Implement
-[src/classifier/recommendations.rs](../src/classifier/recommendations.rs)
-to map vulnerability IDs (the ones emitted in Phase 3) to prioritised
-`Recommendation` structs (already defined in Phase 2). This unblocks
-the orchestrator in Phase 9 and lets the JSON report show real
-remediation guidance.
+The committed `.cargo/config.toml` linker path is workstation-specific.
+Update it or use a Developer Command Prompt. This is fine for now since
+the project is single-developer; revisit before publishing.

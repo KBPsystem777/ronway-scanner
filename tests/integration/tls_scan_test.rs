@@ -1,30 +1,31 @@
-use ronway_scanner::scanner::tls::TlsScanner;
+//! Real-world TLS handshake against example.com. `#[ignore]`d so it does
+//! not run as part of the standard test suite.
+
+use ronway_scanner::scanner::tls::{TlsScanError, TlsScanner};
 
 #[tokio::test]
 #[ignore = "makes real network connection; run with `cargo test -- --ignored`"]
 async fn example_com_returns_finding() {
-    let finding = TlsScanner::scan("example.com", 443)
+    let result = TlsScanner::scan("example.com", 443)
         .await
-        .expect("TLS scan should succeed against example.com");
+        .expect("scan should succeed against example.com");
 
+    let finding = &result.finding;
+    assert!(finding.protocol_version.starts_with("TLSv1."));
+    assert!(!finding.cipher_suite.is_empty());
+    assert!(!finding.key_exchange.is_empty());
     assert!(
-        finding.protocol_version.starts_with("TLSv1."),
-        "expected TLS version, got {}",
-        finding.protocol_version
-    );
-    assert!(
-        !finding.cipher_suite.is_empty(),
-        "cipher suite must be populated"
-    );
-    assert!(
-        !finding.key_exchange.is_empty(),
-        "key exchange must be populated"
+        result.peer_cert_der.is_some(),
+        "leaf cert DER must be exposed"
     );
 }
 
 #[tokio::test]
 #[ignore = "makes real network connection; run with `cargo test -- --ignored`"]
 async fn unreachable_port_errors_cleanly() {
-    let result = TlsScanner::scan("example.com", 1).await;
-    assert!(result.is_err(), "scanning a closed port should error");
+    let res = TlsScanner::scan("example.com", 1).await;
+    assert!(matches!(
+        res,
+        Err(TlsScanError::TcpConnect { .. } | TlsScanError::Timeout { .. })
+    ));
 }

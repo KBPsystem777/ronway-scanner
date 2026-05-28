@@ -52,15 +52,12 @@ impl RiskScorer {
                 " Urgent migration to NIST post-quantum primitives (FIPS 203/204) \
                  should be scheduled."
             }
-            RiskLevel::Medium => {
-                " Plan a post-quantum migration within the next 6 months."
-            }
-            RiskLevel::Low => {
-                " Monitor cryptographic posture and prepare a migration plan."
-            }
-            RiskLevel::Pass => {
-                " The endpoint meets current post-quantum readiness guidance."
-            }
+            RiskLevel::Medium => " Plan a post-quantum migration within the next 6 months.",
+            RiskLevel::Low => " Monitor cryptographic posture and prepare a migration plan.",
+            RiskLevel::Pass => " The endpoint meets current post-quantum readiness guidance.",
+            // `Unknown` is set directly by the orchestrator for unreachable
+            // scans and never flows through this summary builder.
+            RiskLevel::Unknown => "",
         };
 
         format!(
@@ -123,10 +120,6 @@ impl RiskScorer {
             // HTTP
             "NO_HSTS" => 5,
             "SERVER_HEADER_LEAK" => 5,
-
-            // Scan-pipeline failures (treated as evidence of misconfiguration)
-            "TLS_SCAN_FAILED" => 40,
-            "CERT_SCAN_FAILED" => 30,
 
             _ => 0,
         }

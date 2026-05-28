@@ -219,24 +219,6 @@ impl RecommendationEngine {
                 nist_algorithm: "N/A — information disclosure hardening".into(),
             },
 
-            "TLS_SCAN_FAILED" => Recommendation {
-                priority: 1,
-                action: "Investigate why TLS handshake could not complete".into(),
-                current: "Endpoint unreachable or not speaking TLS on the scanned port".into(),
-                replace_with: "Working TLS 1.3 listener on the expected port".into(),
-                effort_weeks: 1,
-                nist_algorithm: "TLS 1.3 (RFC 8446)".into(),
-            },
-
-            "CERT_SCAN_FAILED" => Recommendation {
-                priority: 1,
-                action: "Investigate why the X.509 certificate could not be retrieved".into(),
-                current: "Certificate retrieval or parsing failed".into(),
-                replace_with: "Valid, parseable certificate served by the endpoint".into(),
-                effort_weeks: 1,
-                nist_algorithm: "RFC 5280".into(),
-            },
-
             _ => return None,
         };
 
@@ -277,10 +259,8 @@ mod tests {
 
     #[test]
     fn duplicates_are_deduplicated() {
-        let recs = RecommendationEngine::generate(&[
-            vuln("RSA_KEY_EXCHANGE"),
-            vuln("RSA_KEY_EXCHANGE"),
-        ]);
+        let recs =
+            RecommendationEngine::generate(&[vuln("RSA_KEY_EXCHANGE"), vuln("RSA_KEY_EXCHANGE")]);
         assert_eq!(recs.len(), 1);
     }
 

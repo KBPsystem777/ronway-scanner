@@ -9,3 +9,10 @@
 # (which sets PATH so MSVC's link.exe wins on its own).
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+
+# `cargo ronway ...` builds + runs the binary. Bare `cargo ronway` (no args)
+# prints the welcome screen. Examples:
+#   cargo ronway scan -t example.com
+#   cargo ronway serve --port 3001
+[alias]
+ronway = "run --release --bin ronway --"

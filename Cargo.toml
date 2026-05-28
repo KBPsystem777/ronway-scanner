@@ -3,10 +3,15 @@ name = "ronway-scanner"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "ronway"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 x509-parser = "0.16"
@@ -19,14 +24,48 @@ rayon = "1"
 colored = "2"
 indicatif = "0.17"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 hickory-resolver = "0.24"
+futures = "0.3"
+printpdf = "0.7"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+time = "0.3"
 
 [[test]]
 name = "scoring_test"
 path = "tests/unit/scoring_test.rs"
 
 [[test]]
+name = "cert_test"
+path = "tests/unit/cert_test.rs"
+
+[[test]]
+name = "tls_test"
+path = "tests/unit/tls_test.rs"
+
+[[test]]
+name = "http_test"
+path = "tests/unit/http_test.rs"
+
+[[test]]
+name = "report_test"
+path = "tests/unit/report_test.rs"
+
+[[test]]
+name = "orchestrator_test"
+path = "tests/unit/orchestrator_test.rs"
+
+[[test]]
 name = "tls_scan_test"
 path = "tests/integration/tls_scan_test.rs"
+
+[[test]]
+name = "server_test"
+path = "tests/unit/server_test.rs"

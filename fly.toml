@@ -1,0 +1,38 @@
+# Fly.io deployment (alternative to a plain Docker host / EC2).
+#
+#   fly launch --no-deploy        # once, to create the app
+#   fly volumes create ronway_data --size 1 --region sin
+#   fly deploy
+#
+# Fly persists scan history on the mounted volume. Because the DB is a single
+# SQLite file on one volume, run a single machine (don't scale horizontally
+# without first moving to Postgres).
+
+app = "ronway-scanner"
+primary_region = "sin"   # Singapore — closest Fly region to the Philippines
+
+[build]
+
+[env]
+  RUST_LOG = "ronway_scanner=info"
+  RONWAY_DB_PATH = "/data/ronway.db"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 30
+
+[[mounts]]
+  source = "ronway_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
