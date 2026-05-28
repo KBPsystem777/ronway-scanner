@@ -19,12 +19,13 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -50,6 +51,20 @@ const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(120);
 /// Maximum number of scans running simultaneously across all clients.
 /// Prevents a LinkedIn-style traffic spike from exhausting outbound connections.
 const MAX_CONCURRENT_SCANS: usize = 20;
+/// How long a cached scan result is served without re-scanning the target.
+const SCAN_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+/// Maximum request body accepted by the scan endpoint.
+/// A valid payload is well under 300 bytes; 4 KB is generous headroom.
+const MAX_BODY_BYTES: usize = 4096;
+/// Global ceiling: maximum scan requests accepted per minute across ALL IPs.
+/// A botnet with 1000 IPs each within their per-IP budget would otherwise
+/// generate 10 000 req/min — this hard-caps the total server load.
+const GLOBAL_SCAN_CEILING: usize = 120;
+/// How many times an IP must hit the per-IP rate limit before it is
+/// temporarily blocked entirely.
+const REPEAT_OFFENDER_THRESHOLD: usize = 3;
+/// How long a repeat-offender IP stays blocked.
+const REPEAT_OFFENDER_BAN_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 
 /// Browser origins permitted to call the API. Production origins + the
 /// two common Next.js / Vite dev ports.
@@ -61,30 +76,108 @@ const ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost:5173",
 ];
 
+/// In-memory scan cache entry.
+struct CacheEntry {
+    report: Arc<PublicScanReport>,
+    inserted_at: Instant,
+}
+
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
     limiter: Arc<Mutex<RateLimiter>>,
     scan_slots: Arc<Semaphore>,
+    /// Global scan request counter, reset every minute by a background task.
+    /// Caps total load regardless of how many distinct IPs are involved.
+    global_scan_count: Arc<AtomicUsize>,
+    /// IPs temporarily blocked for repeatedly exhausting their rate limit.
+    blocked_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    /// Short-lived cache keyed by (host, port). Serves repeat scans of the
+    /// same target without opening new TLS connections.
+    scan_cache: Arc<Mutex<HashMap<(String, u16), CacheEntry>>>,
+    /// Token required for admin endpoints. Read from `RONWAY_ADMIN_TOKEN` at
+    /// startup. `None` means the env var was not set — admin endpoints return
+    /// 401 until the operator configures it.
+    admin_token: Option<Arc<str>>,
     store: ScanStore,
 }
 
 impl AppState {
     /// State with scan-history persistence disabled (used by tests).
     pub fn new() -> Self {
-        Self::with_store(ScanStore::disabled())
-    }
-
-    /// State that records every completed scan to `store`.
-    pub fn with_store(store: ScanStore) -> Self {
         Self {
             limiter: Arc::new(Mutex::new(RateLimiter::new(
                 RATE_LIMIT_MAX_REQUESTS,
                 RATE_LIMIT_WINDOW,
             ))),
             scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS)),
+            global_scan_count: Arc::new(AtomicUsize::new(0)),
+            blocked_ips: Arc::new(Mutex::new(HashMap::new())),
+            scan_cache: Arc::new(Mutex::new(HashMap::new())),
+            admin_token: None,
+            store: ScanStore::disabled(),
+        }
+    }
+
+    /// State with a hardcoded admin token — use in tests only.
+    pub fn with_test_token(token: &str) -> Self {
+        let mut state = Self::new();
+        state.admin_token = Some(Arc::from(token));
+        state
+    }
+
+    /// State that records every completed scan to `store`.
+    pub fn with_store(store: ScanStore) -> Self {
+        let admin_token = std::env::var("RONWAY_ADMIN_TOKEN")
+            .ok()
+            .map(|t| Arc::from(t.as_str()));
+        if admin_token.is_none() {
+            warn!("RONWAY_ADMIN_TOKEN is not set — admin endpoints (/api/scans, /api/sites) will return 401");
+        }
+        Self {
+            limiter: Arc::new(Mutex::new(RateLimiter::new(
+                RATE_LIMIT_MAX_REQUESTS,
+                RATE_LIMIT_WINDOW,
+            ))),
+            scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS)),
+            global_scan_count: Arc::new(AtomicUsize::new(0)),
+            blocked_ips: Arc::new(Mutex::new(HashMap::new())),
+            scan_cache: Arc::new(Mutex::new(HashMap::new())),
+            admin_token,
             store,
         }
+    }
+}
+
+/// Constant-time token comparison — prevents timing-oracle attacks where an
+/// attacker could infer prefix matches by measuring response latency.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Check that the request carries a valid `Authorization: Bearer <token>`
+/// header matching the server's configured admin token.
+fn require_admin(headers: &HeaderMap, token: &Option<Arc<str>>) -> Result<(), ApiError> {
+    let Some(expected) = token else {
+        // Token not configured — treat as disabled rather than open.
+        return Err(ApiError::Unauthorized);
+    };
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if constant_time_eq(provided, expected) {
+        Ok(())
+    } else {
+        warn!("admin endpoint: invalid or missing token");
+        Err(ApiError::Unauthorized)
     }
 }
 
@@ -93,6 +186,7 @@ impl Default for AppState {
         Self::new()
     }
 }
+
 
 /// Build the axum `Router` without binding to a port. Useful for tests
 /// that want to drive the server in-process.
@@ -113,6 +207,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/scans", get(list_scans_handler))
         .route("/api/scans/:domain", get(scans_by_domain_handler))
         .route("/api/sites", get(sites_handler))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(
             // `log_requests` is outermost so it records every request —
             // including CORS preflights short-circuited by the cors layer.
@@ -123,22 +218,31 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Resolve the real client IP. The API is meant to sit behind the local
-/// reverse proxy (Nginx), which sets `X-Forwarded-For` / `X-Real-IP`; the
-/// scanner port itself must stay firewalled so those headers can be trusted.
-/// Falls back to the socket peer when no proxy header is present (direct hit).
+/// Resolve the real client IP.
+///
+/// Proxy headers (`X-Forwarded-For`, `X-Real-IP`) are **only trusted when the
+/// TCP connection itself came from loopback** — meaning the request arrived
+/// through the local Nginx reverse proxy, not directly from the internet.
+/// If someone bypasses Nginx and connects straight to port 3001, the socket
+/// IP is used as-is and any spoofed proxy headers are ignored.
 fn client_ip(headers: &HeaderMap, socket: IpAddr) -> IpAddr {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
+    let from_local_proxy = match socket {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if from_local_proxy {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
+                return ip;
+            }
+        }
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse().ok())
+        {
             return ip;
         }
-    }
-    if let Some(ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse().ok())
-    {
-        return ip;
     }
     socket
 }
@@ -199,7 +303,11 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let store = ScanStore::connect(&db_path).await?;
 
     let state = AppState::with_store(store);
-    spawn_cleanup_task(state.limiter.clone());
+    spawn_cleanup_task(
+        state.limiter.clone(),
+        state.global_scan_count.clone(),
+        state.blocked_ips.clone(),
+    );
 
     let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -224,14 +332,25 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_cleanup_task(limiter: Arc<Mutex<RateLimiter>>) {
+fn spawn_cleanup_task(
+    limiter: Arc<Mutex<RateLimiter>>,
+    global_count: Arc<AtomicUsize>,
+    blocked_ips: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RATE_LIMIT_CLEANUP_INTERVAL);
-        // Skip the immediate first tick — we just initialised, nothing to prune.
-        tick.tick().await;
+        tick.tick().await; // skip immediate first tick
         loop {
             tick.tick().await;
-            limiter.lock().await.prune(Instant::now());
+            let now = Instant::now();
+            limiter.lock().await.prune(now);
+            // Reset global counter — it tracks req/min so a per-minute reset is correct.
+            global_count.store(0, Ordering::Relaxed);
+            // Evict expired temp-bans.
+            blocked_ips
+                .lock()
+                .await
+                .retain(|_, banned_at| banned_at.elapsed() < REPEAT_OFFENDER_BAN_DURATION);
         }
     });
 }
@@ -245,12 +364,21 @@ struct HealthResponse {
     version: &'static str,
 }
 
-async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse {
+async fn health_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<HealthResponse>, ApiError> {
+    let ip = client_ip(&headers, addr.ip());
+    let mut guard = state.limiter.lock().await;
+    if !guard.check_and_record(ip, Instant::now()) {
+        return Err(ApiError::RateLimited);
+    }
+    Ok(Json(HealthResponse {
         status: "ok",
         service: "ronway-scanner",
         version: env!("CARGO_PKG_VERSION"),
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -268,16 +396,60 @@ async fn scan_handler(
 ) -> Result<Json<PublicScanReport>, ApiError> {
     let client_ip = client_ip(&headers, addr.ip());
 
-    // Rate limit first — never spend cycles on a request we'll throttle.
+    // Temp-ban check — IPs that repeatedly exhaust their per-IP budget.
+    {
+        let blocks = state.blocked_ips.lock().await;
+        if let Some(banned_at) = blocks.get(&client_ip) {
+            if banned_at.elapsed() < REPEAT_OFFENDER_BAN_DURATION {
+                warn!("blocked ip attempt: {}", client_ip);
+                return Err(ApiError::RateLimited);
+            }
+            // Ban expired — falls through; stale entry cleaned up by background task.
+        }
+    }
+
+    // Global ceiling — caps total scan load regardless of how many IPs are involved.
+    let prev = state
+        .global_scan_count
+        .fetch_add(1, Ordering::Relaxed);
+    if prev >= GLOBAL_SCAN_CEILING {
+        state.global_scan_count.fetch_sub(1, Ordering::Relaxed);
+        warn!("global ceiling hit: {} req/min", GLOBAL_SCAN_CEILING);
+        return Err(ApiError::ServerBusy);
+    }
+
+    // Per-IP rate limit — checked after global ceiling to avoid mutex contention
+    // from requests that would be rejected globally anyway.
     {
         let mut guard = state.limiter.lock().await;
         if !guard.check_and_record(client_ip, Instant::now()) {
-            warn!("rate limit hit: {}", client_ip);
+            state.global_scan_count.fetch_sub(1, Ordering::Relaxed);
+            let hits = guard.throttle_count(&client_ip);
+            warn!("rate limit hit: {} (throttled {} times)", client_ip, hits);
+            if hits >= REPEAT_OFFENDER_THRESHOLD {
+                drop(guard);
+                let mut blocks = state.blocked_ips.lock().await;
+                blocks.entry(client_ip).or_insert_with(Instant::now);
+                warn!("temp-banned repeat offender: {}", client_ip);
+            }
             return Err(ApiError::RateLimited);
         }
     }
 
     let (host, port) = validate_target(&req.target, req.port)?;
+
+    // Cache check — serve a recent result without burning a TLS connection.
+    // This is the primary defence against repeated scans of the same target
+    // (e.g. 500 people scanning bsp.gov.ph after a LinkedIn post).
+    {
+        let cache = state.scan_cache.lock().await;
+        if let Some(entry) = cache.get(&(host.clone(), port)) {
+            if entry.inserted_at.elapsed() < SCAN_CACHE_TTL {
+                info!("cache hit {} -> {}:{}", client_ip, host, port);
+                return Ok(Json((*entry.report).clone()));
+            }
+        }
+    }
 
     // Acquire a scan slot — rejects immediately if MAX_CONCURRENT_SCANS are
     // already running. try_acquire avoids queuing callers behind a busy server.
@@ -289,15 +461,29 @@ async fn scan_handler(
     info!("scan request {} -> {}:{}", client_ip, host, port);
 
     let scan = RonwayScanner::scan_with_port(&host, port);
-    let report = tokio::time::timeout(SCAN_TIMEOUT, scan)
-        .await
-        .map_err(|_| ApiError::ScanTimeout)?;
+    let scan_result = tokio::time::timeout(SCAN_TIMEOUT, scan).await;
+    state.global_scan_count.fetch_sub(1, Ordering::Relaxed);
+    let report = scan_result.map_err(|_| ApiError::ScanTimeout)?;
 
     // Persist the FULL report server-side (best-effort) before trimming it
     // down to the free-tier view returned to the public caller.
     state.store.record(client_ip, &report).await;
 
-    Ok(Json(PublicScanReport::from_report(&report)))
+    let public = Arc::new(PublicScanReport::from_report(&report));
+
+    // Populate cache for subsequent requests within the TTL window.
+    {
+        let mut cache = state.scan_cache.lock().await;
+        cache.insert(
+            (host, port),
+            CacheEntry {
+                report: Arc::clone(&public),
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    Ok(Json((*public).clone()))
 }
 
 // ─── Scan history / aggregation ─────────────────────────────────────────────
@@ -317,10 +503,13 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
 }
 
 /// `GET /api/scans?limit=&offset=` — every scan, newest first.
+/// Requires `Authorization: Bearer <RONWAY_ADMIN_TOKEN>`.
 async fn list_scans_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<crate::store::ScanSummary>>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
     let limit = clamp_limit(params.limit);
     let offset = params.offset.unwrap_or(0).max(0);
     let scans = state
@@ -332,11 +521,14 @@ async fn list_scans_handler(
 }
 
 /// `GET /api/scans/:domain` — scan history for one site, newest first.
+/// Requires `Authorization: Bearer <RONWAY_ADMIN_TOKEN>`.
 async fn scans_by_domain_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(domain): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<crate::store::ScanSummary>>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
     let limit = clamp_limit(params.limit);
     let scans = state
         .store
@@ -348,10 +540,13 @@ async fn scans_by_domain_handler(
 
 /// `GET /api/sites?limit=` — per-site rollup (scan count, first/last seen,
 /// latest score), most-scanned first.
+/// Requires `Authorization: Bearer <RONWAY_ADMIN_TOKEN>`.
 async fn sites_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<crate::store::SiteAggregate>>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
     let limit = clamp_limit(params.limit);
     let sites = state
         .store
@@ -372,7 +567,7 @@ const FREE_TIER_ACTION_PREVIEW: usize = 3;
 /// configs, rollout sequencing, effort estimates). Those fields are the BPxAI
 /// consulting deliverable, so the API exposes only de-duplicated action
 /// headlines plus a count and an upgrade pointer.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct PublicScanReport {
     target: ScanTarget,
     risk_score: RiskScore,
@@ -387,7 +582,7 @@ struct PublicScanReport {
     upgrade: Upgrade,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Upgrade {
     message: &'static str,
     url: &'static str,
@@ -593,6 +788,8 @@ pub struct RateLimiter {
     max_requests: usize,
     window: Duration,
     hits: HashMap<IpAddr, Vec<Instant>>,
+    /// How many times each IP has been rejected within the current window.
+    throttle_count: HashMap<IpAddr, usize>,
 }
 
 impl RateLimiter {
@@ -601,20 +798,27 @@ impl RateLimiter {
             max_requests,
             window,
             hits: HashMap::new(),
+            throttle_count: HashMap::new(),
         }
     }
 
-    /// Record a request from `ip` at `now`. Returns `true` if the
-    /// request is within the budget, `false` if it should be rejected.
+    /// Record a request from `ip` at `now`. Returns `true` if the request is
+    /// within the budget, `false` if it should be rejected.
+    /// Also increments the throttle counter so callers can detect repeat offenders.
     pub fn check_and_record(&mut self, ip: IpAddr, now: Instant) -> bool {
         let entry = self.hits.entry(ip).or_default();
-        // Drop hits older than the window.
         entry.retain(|t| now.duration_since(*t) < self.window);
         if entry.len() >= self.max_requests {
+            *self.throttle_count.entry(ip).or_default() += 1;
             return false;
         }
         entry.push(now);
         true
+    }
+
+    /// How many times `ip` has been throttled since the last prune.
+    pub fn throttle_count(&self, ip: &IpAddr) -> usize {
+        self.throttle_count.get(ip).copied().unwrap_or(0)
     }
 
     /// Drop every IP whose most recent hit fell outside the window.
@@ -623,6 +827,7 @@ impl RateLimiter {
             hits.retain(|t| now.duration_since(*t) < self.window);
             !hits.is_empty()
         });
+        self.throttle_count.clear();
     }
 
     #[cfg(test)]
@@ -636,6 +841,7 @@ impl RateLimiter {
 #[derive(Debug)]
 pub enum ApiError {
     InvalidTarget(String),
+    Unauthorized,
     RateLimited,
     ServerBusy,
     ScanTimeout,
@@ -660,6 +866,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             ApiError::InvalidTarget(m) => (StatusCode::BAD_REQUEST, "invalid_target", m),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid Authorization: Bearer <token> header required".into(),
+            ),
             ApiError::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",

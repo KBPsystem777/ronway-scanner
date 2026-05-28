@@ -21,6 +21,9 @@ services:
     environment:
       RUST_LOG: "ronway_scanner=info"
       RONWAY_DB_PATH: "/data/ronway.db"
+      # Required to enable /api/scans and /api/sites endpoints.
+      # Generate a strong token: openssl rand -hex 32
+      RONWAY_ADMIN_TOKEN: "${RONWAY_ADMIN_TOKEN}"
     volumes:
       - ronway_data:/data
 

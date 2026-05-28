@@ -11,11 +11,14 @@ use ronway_scanner::server::{router, AppState};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+const TEST_ADMIN_TOKEN: &str = "test-admin-token-abc123";
+
 /// Bind on 127.0.0.1:0, spawn the server, and return the base URL.
 async fn spawn_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(AppState::new()).into_make_service_with_connect_info::<SocketAddr>();
+    let app = router(AppState::with_test_token(TEST_ADMIN_TOKEN))
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -192,13 +195,41 @@ async fn scan_rate_limit_kicks_in_after_10_requests() {
 }
 
 #[tokio::test]
+async fn history_endpoints_require_auth() {
+    let base = spawn_server().await;
+    let c = client();
+
+    for path in ["/api/scans", "/api/sites", "/api/scans/example.com"] {
+        // No token — must get 401.
+        let resp = c.get(format!("{}{}", base, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "{} without token should be 401", path);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "unauthorized");
+
+        // Wrong token — must also get 401.
+        let resp = c
+            .get(format!("{}{}", base, path))
+            .header("Authorization", "Bearer wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{} with wrong token should be 401", path);
+    }
+}
+
+#[tokio::test]
 async fn history_endpoints_return_empty_array_when_store_disabled() {
     let base = spawn_server().await;
     let c = client();
 
     for path in ["/api/scans", "/api/sites", "/api/scans/example.com"] {
-        let resp = c.get(format!("{}{}", base, path)).send().await.unwrap();
-        assert_eq!(resp.status(), 200, "{} should be 200", path);
+        let resp = c
+            .get(format!("{}{}", base, path))
+            .header("Authorization", format!("Bearer {}", TEST_ADMIN_TOKEN))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{} with valid token should be 200", path);
         let body: Value = resp.json().await.unwrap();
         assert!(body.is_array(), "{} should return a JSON array", path);
         assert_eq!(
