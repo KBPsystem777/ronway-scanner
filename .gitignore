@@ -1,2 +1,12 @@
 /target
 .claude/*
+keys/
+
+# Private keys — never commit (SSH / Lightsail .pem)
+*.pem
+*.key
+
+# Local scan-history database
+*.db
+*.db-shm
+*.db-wal

@@ -14,7 +14,10 @@ services:
     container_name: ronway
     restart: unless-stopped
     ports:
-      - "3001:3001"
+      # Loopback-only: the API is reached through the host's Nginx reverse
+      # proxy, never directly from the internet. Use "3001:3001" if you want
+      # to expose it directly (e.g. local testing).
+      - "127.0.0.1:3001:3001"
     environment:
       RUST_LOG: "ronway_scanner=info"
       RONWAY_DB_PATH: "/data/ronway.db"

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -116,6 +116,26 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Resolve the real client IP. The API is meant to sit behind the local
+/// reverse proxy (Nginx), which sets `X-Forwarded-For` / `X-Real-IP`; the
+/// scanner port itself must stay firewalled so those headers can be trusted.
+/// Falls back to the socket peer when no proxy header is present (direct hit).
+fn client_ip(headers: &HeaderMap, socket: IpAddr) -> IpAddr {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
+            return ip;
+        }
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+    socket
+}
+
 /// Morgan-style per-request logger: one coloured line per request with
 /// method, path, status, latency, and client IP. Emitted at INFO so it
 /// shows by default when running `ronway serve`.
@@ -130,6 +150,7 @@ async fn log_requests(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+    let ip = client_ip(req.headers(), addr.ip());
     let started = Instant::now();
 
     let response = next.run(req).await;
@@ -155,7 +176,7 @@ async fn log_requests(
         path,
         status_colored,
         format!("{:.1}ms", elapsed_ms).dimmed(),
-        addr.ip().to_string().dimmed(),
+        ip.to_string().dimmed(),
     );
 
     response
@@ -235,9 +256,10 @@ struct ScanRequest {
 async fn scan_handler(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ScanRequest>,
 ) -> Result<Json<PublicScanReport>, ApiError> {
-    let client_ip = addr.ip();
+    let client_ip = client_ip(&headers, addr.ip());
 
     // Rate limit first — never spend cycles on a request we'll throttle.
     {
@@ -804,6 +826,34 @@ mod tests {
             validate_target("2001:db8::1:443", None),
             Err(ApiError::InvalidTarget(_))
         ));
+    }
+
+    // ─── client IP resolution ─────────────────────────────────────
+
+    #[test]
+    fn client_ip_prefers_x_forwarded_for() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        let socket = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(
+            client_ip(&h, socket),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_x_real_ip_then_socket() {
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "198.51.100.9".parse().unwrap());
+        let socket = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(
+            client_ip(&h, socket),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))
+        );
+
+        // No proxy headers → socket peer.
+        let empty = HeaderMap::new();
+        assert_eq!(client_ip(&empty, socket), socket);
     }
 
     // ─── rate limiter ─────────────────────────────────────────────

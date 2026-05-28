@@ -94,6 +94,48 @@ ronway version
 For a step-by-step local terminal walkthrough (build, every command, the
 API server, exit codes, troubleshooting), see [doc/USAGE.md](doc/USAGE.md).
 
+---
+
+## API Server
+
+`ronway serve` exposes the scanner as a JSON HTTP API (used by the
+bpxai.com/ronway frontend). It binds `0.0.0.0:3001` by default, enforces a
+per-IP rate limit, validates targets against SSRF, and records every
+completed scan to a local SQLite database (`RONWAY_DB_PATH`, default
+`ronway.db`).
+
+```bash
+ronway serve --port 3001
+```
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/health` | Liveness check. |
+| `POST /api/scan` | Body `{ "target": "example.com", "port": 443 }` → free-tier report (findings + score; the detailed remediation roadmap is reserved for BPxAI engagements). |
+| `GET /api/scans?limit=&offset=` | All recorded scans, newest first. |
+| `GET /api/scans/{domain}` | Scan history for one site. |
+| `GET /api/sites?limit=` | Per-site rollup — how many times each domain was scanned, plus its latest score. |
+
+CORS is restricted to the bpxai.com origins and local dev ports. When run
+behind a reverse proxy, the real client IP is read from `X-Forwarded-For` /
+`X-Real-IP` (keep the app port firewalled so those headers are trustworthy).
+
+---
+
+## Deployment
+
+A Docker image, `docker-compose.yml`, and `fly.toml` are included. The
+recommended low-cost host is **AWS Lightsail (Bitnami Nginx blueprint, ~$5/mo)**:
+Nginx reverse-proxies to the container and provides free Let's Encrypt TLS,
+while scan history persists on a Docker volume.
+
+```bash
+docker compose up -d --build      # any Docker host
+```
+
+Full step-by-step for Lightsail (swap, Docker, Nginx vhost, HTTPS, DNS,
+firewall, backups) is in **[doc/DEPLOY.md](doc/DEPLOY.md)**.
+
 Set `RUST_LOG=debug` (or `info` / `warn`) in the environment to control log
 verbosity — the scanner uses `tracing` and respects the standard level
 syntax.
